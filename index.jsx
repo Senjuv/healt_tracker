@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-// import { createRoot } from 'react-dom/client'; // ELIMINADA: Causaba conflicto de montaje
+import { createRoot } from 'react-dom/client'; // RE-AÑADIDA: Necesaria para el montaje en entornos de build (Vercel)
 import { initializeApp } from 'firebase/app';
 import { 
     getAuth, signInAnonymously, signInWithCustomToken, 
@@ -283,7 +283,7 @@ const AITools = ({ userId, weightData, db }) => {
             return (
                 <div className="space-y-4">
                     <label className="block text-sm font-medium text-gray-700">
-                        Sube una foto de tu comida:
+                        Sube una foto de tu plato para el análisis nutricional:
                     </label>
                     <input
                         type="file"
@@ -431,9 +431,10 @@ const SkinJournal = ({ generateAIResponse }) => {
         const systemInstruction = "Actúa como un experto en cuidado de la piel (skincare). Analiza la imagen del rostro proporcionada, identifica problemas comunes (como acné, enrojecimiento, sequedad o brillo) y ofrece una rutina básica de cuidado con sugerencias de ingredientes clave. La respuesta debe ser estructurada en Markdown (Análisis, Rutina Sugerida, Ingredientes Clave).";
         const finalPrompt = `Analiza la imagen del rostro. El usuario proporciona la siguiente información adicional: ${prompt || 'Ninguna'}. Genera el análisis de la piel.`;
         
-        await generateAIResponse(finalPrompt, base64Image, systemInstruction);
-
-        setIsLoading(false);
+        // Uso de la función pasada por prop, asumiendo que es una función que retorna otra función
+        // para manejar el estado de este componente.
+        const runGeneration = generateAIResponse(finalPrompt, base64Image, systemInstruction);
+        await runGeneration(setAiResponse, setIsLoading);
     };
 
     return (
@@ -561,7 +562,7 @@ const App = () => {
     // 2. Escucha de Datos de Firestore (Peso)
     useEffect(() => {
         // Ejecutar solo si Firebase está listo, la autenticación ha finalizado y tenemos un userId
-        if (!dbInstance || !userId || !isAuthReady || !authInstance.currentUser) {
+        if (!dbInstance || !userId || !isAuthReady || !authInstance?.currentUser) {
             return;
         }
 
@@ -589,7 +590,13 @@ const App = () => {
 
 
     const renderContent = () => {
-        const commonProps = { userId, db: dbInstance, isAuthReady, generateAIResponse: AITools.generateAIResponse };
+        // La función de IA ahora se pasa como un wrapper para manejar el estado local del SkinJournal
+        const generateSkinAIWrapper = (prompt, base64Image, systemInstruction, enableSearch) => (setAiResponse, setIsLoading) => {
+            const runGeneration = AITools.generateAIResponse; // Obtener la función estática
+            return runGeneration(prompt, base64Image, systemInstruction, enableSearch)(setAiResponse, setIsLoading);
+        };
+
+        const commonProps = { userId, db: dbInstance, isAuthReady, generateAIResponse: generateSkinAIWrapper };
 
         if (activeTab === 'home') {
             return (
@@ -649,10 +656,10 @@ const App = () => {
 };
 
 // Se asegura que la función de generación de IA esté disponible para el SkinJournal
-AITools.generateAIResponse = (prompt, base64Image, systemInstruction, enableSearch) => {
-    // Esta función es una copia simplificada de la lógica interna de AITools 
-    // para ser pasada a otros componentes que la necesiten.
-    const runGeneration = async (setAiResponse, setIsLoading) => {
+// Esta función ahora retorna una función que, al ser llamada, ejecuta la lógica de fetch.
+AITools.generateAIResponse = (prompt, base64Image, systemInstruction, enableSearch) => (setAiResponse, setIsLoading) => {
+    // La función interna es la que se ejecuta cuando el componente SkinJournal llama a handleSubmit
+    const runGeneration = async () => {
         setIsLoading(true);
         setAiResponse(null);
 
@@ -693,7 +700,18 @@ AITools.generateAIResponse = (prompt, base64Image, systemInstruction, enableSear
             setIsLoading(false);
         }
     };
-    return runGeneration;
+    return runGeneration(); // Retorna la Promesa de ejecución
 };
 
 export default App;
+
+// --- LÓGICA DE MONTAJE PARA ENTORNOS DE PRODUCCIÓN (Vercel) ---
+// **Si estás desplegando en Vercel**, y este es el archivo de entrada (entry point)
+// de tu aplicación, DESCOMENTA el siguiente bloque.
+/*
+const container = document.getElementById('root');
+if (container) {
+    const root = createRoot(container);
+    root.render(<App />);
+}
+*/
