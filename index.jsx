@@ -25,793 +25,619 @@ const API_MODEL_TEXT = "gemini-2.5-flash-preview-09-2025";
 const API_URL_TEXT = `https://generativelanguage.googleapis.com/v1beta/models/${API_MODEL_TEXT}:generateContent?key=`;
 
 // URL para el placeholder de carga de imagen/documento (si el usuario no sube una)
-const DEFAULT_IMAGE_URL = "https://placehold.co/100x100/A0A0A0/FFFFFF?text=IMAGEN";
+const DEFAULT_IMAGE_URL = "https://placehold.co/300x200/222/fff?text=Carga+tu+Imagen";
 
-// --- UTILIDADES ---
+// --- INICIALIZACIÓN DE FIREBASE ---
+let app;
+let db;
+let auth;
+if (Object.keys(firebaseConfig).length > 0) {
+    app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+}
 
-/**
- * Convierte un archivo a base64.
- * @param {File} file - El archivo a convertir.
- * @returns {Promise<string>} Promesa que resuelve en la cadena base64.
- */
-const fileToBase64 = (file) => {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => resolve(reader.result.split(',')[1]);
-        reader.onerror = (error) => reject(error);
-    });
-};
-
-/**
- * Función de retardo para el retroceso exponencial (exponential backoff).
- */
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-/**
- * Ejecuta una llamada a la API de Gemini con reintentos.
- */
-const fetchWithRetry = async (url, options, maxRetries = 3) => {
-    for (let i = 0; i < maxRetries; i++) {
+// Función para simular la lógica de exponential backoff y fetch
+const fetchWithBackoff = async (url, options) => {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
         try {
             const response = await fetch(url, options);
             if (!response.ok) {
-                // Si la respuesta no es OK, revisamos si es un error 429 (Rate Limit) o 5xx (Servidor)
-                if (response.status === 429 || response.status >= 500) {
-                    throw new Error(`Server or Rate Limit Error: ${response.status}`);
-                }
-                // Para otros errores (400, 403), salimos del bucle de reintentos
+                // Manejar error de HTTP
                 const errorBody = await response.json();
-                console.error("API Error Response:", errorBody);
-                throw new Error(errorBody.error?.message || `HTTP Error: ${response.status}`);
+                throw new Error(`HTTP error! status: ${response.status}. Details: ${JSON.stringify(errorBody)}`);
             }
-            return response.json();
+            return response;
         } catch (error) {
-            if (i === maxRetries - 1) {
-                console.error("Fetch failed after all retries:", error);
-                throw error;
+            lastError = error;
+            console.error(`Attempt ${attempt + 1} failed:`, error.message);
+            if (attempt < 2) {
+                // Esperar 2^attempt segundos
+                const delay = Math.pow(2, attempt) * 1000;
+                await new Promise(resolve => setTimeout(resolve, delay));
             }
-            const backoffTime = Math.pow(2, i) * 1000 + Math.random() * 1000;
-            console.warn(`Retry ${i + 1}/${maxRetries}. Retrying in ${backoffTime / 1000}s due to: ${error.message}`);
-            await delay(backoffTime);
         }
     }
+    throw new Error(`Failed after multiple retries: ${lastError.message}`);
 };
 
-// --- COMPONENTES UI BÁSICOS ---
 
-const Spinner = () => (
-    <div className="flex items-center justify-center space-x-2">
-        <div className="w-4 h-4 rounded-full animate-pulse bg-indigo-500"></div>
-        <div className="w-4 h-4 rounded-full animate-pulse bg-indigo-500"></div>
-        <div className="w-4 h-4 rounded-full animate-pulse bg-indigo-500"></div>
-    </div>
-);
+// --- COMPONENTES DE LA APLICACIÓN ---
 
-const IconButton = ({ children, onClick, disabled = false }) => (
-    <button 
-        onClick={onClick} 
-        disabled={disabled}
-        className={`p-2 rounded-full transition-all duration-300 shadow-lg 
-            ${disabled ? 'bg-gray-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800'} 
-            text-white flex items-center justify-center`}
-    >
-        {children}
-    </button>
-);
+// Componente para la entrada de peso y el gráfico
+const WeightTracker = ({ userId, db, isAuthReady, weightData }) => {
+    const [currentWeight, setCurrentWeight] = useState('');
+    const [saveMessage, setSaveMessage] = useState('');
 
-// --- FUNCIONES DE LA API DE GEMINI ---
-
-/**
- * Función principal para la generación de texto simple.
- */
-const generateContent = async (systemPrompt, userQuery) => {
-    const payload = {
-        contents: [{ parts: [{ text: userQuery }] }],
-        systemInstruction: {
-            parts: [{ text: systemPrompt }]
-        },
-    };
-
-    const response = await fetchWithRetry(API_URL_TEXT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    });
-
-    const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error("No se pudo obtener la respuesta de la IA.");
-    return text;
-};
-
-/**
- * Función para análisis multimodal (Imagen + Texto).
- */
-const generateMultimodalContent = async (systemPrompt, userQuery, base64Image) => {
-    const payload = {
-        contents: [{ 
-            parts: [
-                { text: userQuery },
-                { inlineData: { mimeType: "image/png", data: base64Image } }
-            ]
-        }],
-        systemInstruction: {
-            parts: [{ text: systemPrompt }]
-        },
-    };
-
-    const response = await fetchWithRetry(API_URL_TEXT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    });
-
-    const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error("No se pudo obtener la respuesta de la IA.");
-    return text;
-};
-
-// --- CONTEXTO DE FIREBASE ---
-
-const dbContext = {
-    app: null,
-    db: null,
-    auth: null,
-    userId: null,
-};
-
-// --- COMPONENTES PRINCIPALES ---
-
-const RecordWeight = ({ db, userId, onRecord }) => {
-    const [weight, setWeight] = useState('');
-    const [loading, setLoading] = useState(false);
-    const [message, setMessage] = useState('');
-
-    const handleRecord = async () => {
-        if (!db || !userId) {
-            setMessage('Error: Autenticación no lista. Espera a que cargue el ID de usuario.');
+    const handleSaveWeight = async () => {
+        if (!db || !userId || !currentWeight) {
+            setSaveMessage('Error: Faltan datos de usuario o peso.');
             return;
         }
-        const numericWeight = parseFloat(weight);
-        if (isNaN(numericWeight) || numericWeight <= 0) {
-            setMessage('Por favor, ingresa un peso válido.');
+        
+        const weightValue = parseFloat(currentWeight);
+        if (isNaN(weightValue) || weightValue <= 0) {
+            setSaveMessage('Por favor, ingresa un peso válido.');
             return;
         }
-
-        setLoading(true);
-        setMessage('');
 
         try {
             const timestamp = new Date().toISOString();
-            const weightData = {
-                weight: numericWeight,
-                timestamp: timestamp,
-                date: new Date().toLocaleDateString('es-MX'),
-            };
-
-            // Asegurar la ruta privada
             const docRef = doc(db, `artifacts/${appId}/users/${userId}/weights`, timestamp);
-            await setDoc(docRef, weightData);
             
-            setMessage('Peso registrado con éxito.');
-            setWeight('');
-            onRecord(numericWeight); // Actualiza el estado principal
+            await setDoc(docRef, {
+                weight: weightValue,
+                timestamp: timestamp,
+                date: new Date().toLocaleDateString('es-ES'),
+            });
+            
+            setSaveMessage('¡Peso guardado con éxito!');
+            setCurrentWeight('');
+            setTimeout(() => setSaveMessage(''), 3000);
         } catch (error) {
-            console.error("Error al registrar el peso:", error);
-            setMessage(`Error al registrar: ${error.message}`);
-        } finally {
-            setLoading(false);
+            console.error("Error al guardar el peso:", error);
+            setSaveMessage(`Error al guardar: ${error.message}`);
         }
     };
 
+    const sortedData = [...weightData].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    const totalEntries = sortedData.length;
+    const initialWeight = totalEntries > 0 ? sortedData[0].weight : 0;
+    const latestWeight = totalEntries > 0 ? sortedData[totalEntries - 1].weight : 0;
+    const change = latestWeight - initialWeight;
+
     return (
-        <div className="bg-white p-4 rounded-lg shadow-md mb-6">
-            <h3 className="text-lg font-semibold mb-3 text-indigo-700">Registro Diario de Peso</h3>
-            <div className="flex space-x-3 items-center">
-                <input
-                    type="number"
-                    value={weight}
-                    onChange={(e) => setWeight(e.target.value)}
-                    placeholder="Peso (kg o lb)"
-                    className="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
-                    disabled={loading}
-                />
+        <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100 mb-8">
+            <h2 className="text-2xl font-bold text-indigo-800 mb-4 border-b pb-2">Registro de Peso</h2>
+            
+            <div className="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-6 items-start sm:items-end mb-6">
+                <div className="flex-1 w-full">
+                    <label htmlFor="weight" className="block text-sm font-medium text-gray-700">
+                        Peso Actual (kg):
+                    </label>
+                    <input
+                        type="number"
+                        id="weight"
+                        value={currentWeight}
+                        onChange={(e) => setCurrentWeight(e.target.value)}
+                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500"
+                        placeholder="Ej. 75.5"
+                        min="1"
+                    />
+                </div>
                 <button
-                    onClick={handleRecord}
-                    disabled={loading || !weight}
-                    className="bg-green-500 text-white p-2 rounded-lg hover:bg-green-600 transition duration-150 disabled:bg-gray-400 shadow-md"
+                    onClick={handleSaveWeight}
+                    disabled={!isAuthReady || !currentWeight}
+                    className="w-full sm:w-auto px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition duration-150 disabled:opacity-50"
                 >
-                    {loading ? <Spinner /> : "Registrar"}
+                    Guardar Peso
                 </button>
             </div>
-            {message && <p className="mt-2 text-sm text-center" style={{ color: message.includes('Error') ? 'red' : 'green' }}>{message}</p>}
-        </div>
-    );
-};
-
-const WeightHistory = ({ weightData }) => {
-    if (weightData.length === 0) {
-        return <p className="text-gray-500 text-center py-4">Aún no hay registros de peso.</p>;
-    }
-
-    // Ordenar por fecha (timestamp) descendente para la tabla.
-    const sortedData = [...weightData].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    
-    // Para el cálculo de progreso, usamos el array original que ya viene ordenado ascendente 
-    // desde el listener (que ahora ordena en memoria).
-    const sortedForCalc = weightData; 
-
-    const initialWeight = sortedForCalc[0].weight;
-    const currentWeight = sortedForCalc[sortedForCalc.length - 1].weight;
-    
-    const difference = currentWeight - initialWeight;
-    const status = difference > 0 ? 'Ganancia' : difference < 0 ? 'Pérdida' : 'Sin cambios';
-
-    const colorClass = difference > 0 ? 'text-red-600' : difference < 0 ? 'text-green-600' : 'text-gray-600';
-
-    return (
-        <div className="bg-white p-4 rounded-lg shadow-md">
-            <h3 className="text-lg font-semibold mb-3 text-indigo-700">Historial y Progreso</h3>
-            <div className={`p-3 mb-4 rounded-lg border-2 ${difference !== 0 ? 'border-dashed border-indigo-400' : 'border-gray-300'}`}>
-                <p className="text-sm font-medium">Peso Inicial: <span className="font-bold">{initialWeight}</span></p>
-                <p className="text-sm font-medium">Peso Actual: <span className="font-bold">{currentWeight}</span></p>
-                <p className={`text-lg font-bold ${colorClass}`}>
-                    Progreso Total: {status} de {Math.abs(difference).toFixed(2)}
+            
+            {saveMessage && (
+                <p className={`text-sm font-semibold ${saveMessage.includes('Error') ? 'text-red-500' : 'text-green-600'} mt-2`}>
+                    {saveMessage}
                 </p>
-            </div>
-            
-            <div className="max-h-64 overflow-y-auto">
-                <table className="min-w-full text-left text-sm bg-gray-50 rounded-lg">
-                    <thead className="sticky top-0 bg-indigo-100">
-                        <tr>
-                            <th className="py-2 px-3">Fecha</th>
-                            <th className="py-2 px-3 text-right">Peso</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {sortedData.map((data) => (
-                            <tr key={data.timestamp} className="border-t hover:bg-indigo-50">
-                                <td className="py-2 px-3 text-gray-700">{data.date}</td>
-                                <td className="py-2 px-3 text-right font-medium">{data.weight}</td>
-                            </tr>
-                        ))}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    );
-};
+            )}
 
-
-// --- HERRAMIENTAS IA ---
-
-const AiTools = ({ weightData }) => {
-    const [activeTool, setActiveTool] = useState('meal');
-    const [loading, setLoading] = useState(false);
-    const [result, setResult] = useState(null);
-    const [error, setError] = useState(null);
-
-    // --- Estados para Análisis de Fotos de Comida ---
-    const [foodImageFile, setFoodImageFile] = useState(null);
-    const [foodImagePreviewUrl, setFoodImagePreviewUrl] = useState(DEFAULT_IMAGE_URL);
-
-
-    // --- 1. Planificador Nutricional (Texto) ---
-    const [goal, setGoal] = useState('');
-    const [ingredients, setIngredients] = useState('');
-
-    const handlePlanMeal = async () => {
-        if (!goal) { setError("Por favor, describe tu objetivo nutricional."); return; }
-        setError(null);
-        setResult(null);
-        setLoading(true);
-
-        try {
-            const systemPrompt = "Eres un nutricionista experto y motivador. Genera un plan de comidas (desayuno, almuerzo, cena) en formato Markdown para un día basado en el objetivo del usuario. Sé detallado con los ingredientes y las macros estimadas. Responde únicamente con el plan de comidas.";
-            
-            let userQuery = `Mi objetivo es: ${goal}.`;
-            if (ingredients) {
-                userQuery += ` Además, prioriza el uso de estos ingredientes: ${ingredients}.`;
-            }
-
-            const response = await generateContent(systemPrompt, userQuery);
-            setResult(response);
-        } catch (e) {
-            setError(`Error al generar el plan: ${e.message}`);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    // --- 2. Análisis de Fotos de Comida (Multimodal) ---
-    const handleAnalyzeFood = async () => {
-        if (!foodImageFile) { setError("Por favor, sube una foto de tu comida."); return; }
-        setError(null);
-        setResult(null);
-        setLoading(true);
-
-        try {
-            const base64Image = await fileToBase64(foodImageFile);
-            
-            const systemPrompt = "Eres un nutricionista experto. Analiza la foto de la comida. Estima el tipo de plato, los ingredientes principales, y proporciona una estimación de calorías y un desglose macro. Responde en español y en formato Markdown.";
-            const userQuery = "Analiza esta comida para obtener información nutricional (calorías, macros).";
-
-            const response = await generateMultimodalContent(systemPrompt, userQuery, base64Image);
-            setResult(response);
-
-        } catch (e) {
-            console.error("Error en el análisis de comida:", e);
-            setError(`Error al analizar la comida: ${e.message}`);
-        } finally {
-            setLoading(false);
-        }
-    };
-    
-    // --- 3. Analizador de Síntomas (Texto) ---
-    const [symptom, setSymptom] = useState('');
-
-    const handleAnalyzeSymptom = async () => {
-        if (!symptom) { setError("Por favor, describe tu síntoma."); return; }
-        setError(null);
-        setResult(null);
-        setLoading(true);
-
-        try {
-            const systemPrompt = "Eres un asistente de bienestar que ofrece sugerencias nutricionales basadas en síntomas reportados. Siempre incluye una advertencia de que NO eres un médico. Sugiere vitaminas, minerales o alimentos específicos que podrían ayudar con el síntoma reportado. Responde en español y en formato Markdown.";
-            const userQuery = `Estoy experimentando: ${symptom}. ¿Qué nutrientes y alimentos podrían ayudar?`;
-
-            const response = await generateContent(systemPrompt, userQuery);
-            setResult(response);
-        } catch (e) {
-            setError(`Error al analizar el síntoma: ${e.message}`);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    // --- 4. Consejos de Progreso (Texto con Datos) ---
-    const handleGetAdvice = async () => {
-        setError(null);
-        setResult(null);
-        setLoading(true);
-
-        if (weightData.length < 2) {
-            setError("Necesitas al menos dos registros de peso para generar un consejo de progreso significativo.");
-            setLoading(false);
-            return;
-        }
-
-        try {
-            const systemPrompt = "Eres un coach de salud y fitness. Analiza los datos de peso proporcionados y ofrece un mensaje de motivación o un consejo actionable (una acción específica) para el usuario. El tono debe ser positivo y alentador. Responde en español y en un párrafo corto.";
-            
-            // Los datos de weightData ya están ordenados por timestamp ascendente
-            const sortedData = weightData; 
-            
-            let dataSummary = sortedData.map(d => `${d.date}: ${d.weight}`).join(' | ');
-            dataSummary = `Historial de peso (Fecha: Peso): ${dataSummary}`;
-
-            const response = await generateContent(systemPrompt, dataSummary);
-            setResult(response);
-        } catch (e) {
-            setError(`Error al obtener consejos: ${e.message}`);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const renderToolInput = () => {
-        switch (activeTool) {
-            case 'meal':
-                return (
-                    <div>
-                        <input
-                            type="text"
-                            placeholder="Objetivo (ej. ganar músculo, perder peso)"
-                            value={goal}
-                            onChange={(e) => setGoal(e.target.value)}
-                            className="w-full p-2 border border-gray-300 rounded-lg mb-3"
-                        />
-                        <textarea
-                            placeholder="Ingredientes que tienes disponibles (opcional)"
-                            value={ingredients}
-                            onChange={(e) => setIngredients(e.target.value)}
-                            className="w-full p-2 border border-gray-300 rounded-lg mb-3 h-20"
-                        ></textarea>
-                        <button
-                            onClick={handlePlanMeal}
-                            disabled={loading || !goal}
-                            className="w-full bg-indigo-500 text-white p-2 rounded-lg hover:bg-indigo-600 disabled:bg-gray-400"
-                        >
-                            {loading ? <Spinner /> : "Generar Plan de Comidas"}
-                        </button>
-                    </div>
-                );
-            case 'food':
-                return (
-                    <div>
-                        <div className="flex flex-col items-center p-4 border rounded-lg bg-gray-50 mb-3">
-                            <img src={foodImagePreviewUrl} alt="Vista previa de la comida" className="w-24 h-24 object-cover rounded-lg mb-3 border-2 border-indigo-300 shadow-md" />
-                            <input
-                                type="file"
-                                accept="image/png, image/jpeg"
-                                onChange={(e) => {
-                                    const file = e.target.files[0];
-                                    if (file) {
-                                        setFoodImageFile(file);
-                                        setFoodImagePreviewUrl(URL.createObjectURL(file));
-                                    }
-                                }}
-                                className="text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"
-                            />
-                        </div>
-                        <button
-                            onClick={handleAnalyzeFood}
-                            disabled={loading || !foodImageFile}
-                            className="w-full bg-indigo-500 text-white p-2 rounded-lg hover:bg-indigo-600 disabled:bg-gray-400"
-                        >
-                            {loading ? <Spinner /> : "Analizar Foto de Comida"}
-                        </button>
-                    </div>
-                );
-            case 'symptom':
-                return (
-                    <div>
-                        <textarea
-                            placeholder="Describe brevemente el síntoma que experimentas (ej. fatiga, ansiedad por la comida, calambres)"
-                            value={symptom}
-                            onChange={(e) => setSymptom(e.target.value)}
-                            className="w-full p-2 border border-gray-300 rounded-lg mb-3 h-20"
-                        ></textarea>
-                         <button
-                            onClick={handleAnalyzeSymptom}
-                            disabled={loading || !symptom}
-                            className="w-full bg-indigo-500 text-white p-2 rounded-lg hover:bg-indigo-600 disabled:bg-gray-400"
-                        >
-                            {loading ? <Spinner /> : "Analizar Síntoma"}
-                        </button>
-                    </div>
-                );
-            case 'advice':
-                return (
-                    <div>
-                        <p className="text-gray-600 mb-4">
-                            Analizaré tu historial de peso para darte consejos personalizados y motivación. (Registros necesarios: {weightData.length >= 2 ? 'OK' : `Faltan ${2 - weightData.length}`})
-                        </p>
-                        <button
-                            onClick={handleGetAdvice}
-                            disabled={loading || weightData.length < 2}
-                            className="w-full bg-indigo-500 text-white p-2 rounded-lg hover:bg-indigo-600 disabled:bg-gray-400"
-                        >
-                            {loading ? <Spinner /> : "Obtener Consejo de Progreso"}
-                        </button>
-                    </div>
-                );
-            default:
-                return null;
-        }
-    };
-
-    return (
-        <div className="bg-white p-6 rounded-xl shadow-2xl">
-            <h2 className="text-2xl font-bold mb-4 text-indigo-700 border-b pb-2">Herramientas Nutricionales con IA</h2>
-            
-            {/* Pestañas de Navegación */}
-            <div className="flex space-x-2 mb-4 overflow-x-auto pb-2">
-                {['meal', 'food', 'symptom', 'advice'].map(tab => (
-                    <button
-                        key={tab}
-                        onClick={() => { setActiveTool(tab); setResult(null); setError(null); }}
-                        className={`p-2 rounded-lg font-medium transition duration-150 whitespace-nowrap
-                            ${activeTool === tab 
-                                ? 'bg-indigo-100 text-indigo-700 border-b-2 border-indigo-500' 
-                                : 'text-gray-600 hover:bg-gray-100'}`
-                        }
-                    >
-                        {tab === 'meal' ? 'Planificador Nutricional' : tab === 'food' ? 'Análisis de Foto' : tab === 'symptom' ? 'Analizador de Síntomas' : 'Consejos de Progreso'}
-                    </button>
-                ))}
-            </div>
-
-            {/* Input del Tool Activo */}
-            <div className="p-4 border border-gray-200 rounded-lg bg-gray-50 mb-4">
-                {renderToolInput()}
-            </div>
-
-            {/* Resultado de la IA */}
-            <div className="mt-6">
-                {error && <div className="text-red-500 bg-red-100 p-3 rounded-lg border border-red-200">{error}</div>}
-                {loading && <div className="flex justify-center py-4"><Spinner /></div>}
-                {result && (
-                    <div className="bg-green-50 border border-green-200 p-4 rounded-lg shadow-inner whitespace-pre-wrap">
-                        <h3 className="text-lg font-semibold mb-2 text-green-700">Resultado de la IA:</h3>
-                        {result}
-                    </div>
-                )}
+            <div className="mt-6 p-4 bg-indigo-50 rounded-lg">
+                <h3 className="text-lg font-semibold text-indigo-700 mb-3">Tu Progreso</h3>
+                <div className="flex justify-between items-center text-sm font-medium">
+                    <span>Entradas Totales:</span>
+                    <span className="text-gray-900">{totalEntries}</span>
+                </div>
+                <div className="flex justify-between items-center text-sm font-medium mt-1">
+                    <span>Peso Inicial:</span>
+                    <span className="text-gray-900">{initialWeight > 0 ? `${initialWeight} kg` : 'N/A'}</span>
+                </div>
+                <div className="flex justify-between items-center text-sm font-medium mt-1">
+                    <span>Peso Más Reciente:</span>
+                    <span className="text-gray-900">{latestWeight > 0 ? `${latestWeight} kg` : 'N/A'}</span>
+                </div>
+                <div className="flex justify-between items-center text-sm font-medium mt-2 pt-2 border-t border-indigo-200">
+                    <span>Cambio Total:</span>
+                    <span className={`font-bold ${change > 0 ? 'text-red-500' : change < 0 ? 'text-green-600' : 'text-gray-500'}`}>
+                        {change > 0 ? `+${change.toFixed(1)} kg` : change.toFixed(1) + ' kg'}
+                    </span>
+                </div>
             </div>
         </div>
     );
 };
 
+// Componente para las herramientas de IA
+const AITools = ({ userId, weightData, db }) => {
+    const [aiResponse, setAiResponse] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [currentTool, setCurrentTool] = useState('mealPlan');
+    const [prompt, setPrompt] = useState('');
+    const [base64Image, setBase64Image] = useState(null);
+    const [imagePreview, setImagePreview] = useState(DEFAULT_IMAGE_URL);
 
-const SkinAnalysisTool = () => {
-    const [imageFile, setImageFile] = useState(null);
-    const [imagePreviewUrl, setImagePreviewUrl] = useState(DEFAULT_IMAGE_URL);
-    const [notes, setNotes] = useState('');
-    const [loading, setLoading] = useState(false);
-    const [result, setResult] = useState(null);
-    const [error, setError] = useState(null);
-
-    const handleImageChange = (e) => {
-        const file = e.target.files[0];
+    // Función para manejar la subida de imagen y convertirla a Base64
+    const handleImageChange = (event) => {
+        const file = event.target.files[0];
         if (file) {
-            setImageFile(file);
-            setImagePreviewUrl(URL.createObjectURL(file));
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const base64 = reader.result.split(',')[1];
+                setBase64Image(base64);
+                setImagePreview(reader.result);
+            };
+            reader.readAsDataURL(file);
+        } else {
+            setBase64Image(null);
+            setImagePreview(DEFAULT_IMAGE_URL);
         }
     };
 
-    const analyzeSkinImage = async () => {
-        if (!imageFile) { setError("Por favor, sube una imagen de tu rostro."); return; }
-        setError(null);
-        setResult(null);
-        setLoading(true);
+    const generateAIResponse = useCallback(async (currentPrompt, imageBase64, systemInstruction, enableSearch = false) => {
+        setIsLoading(true);
+        setAiResponse(null);
 
         try {
-            const base64Image = await fileToBase64(imageFile);
-            
-            const systemPrompt = "Eres un dermoconsejero experto. Analiza la imagen del rostro proporcionada por el usuario. Evalúa la textura, luminosidad y el tipo de rostro (ej. óvalo, cuadrado). Proporciona consejos específicos de cuidado de la piel y maquillaje que se adapten a las mejoras visibles o a las áreas de enfoque, y al tipo de rostro. Considera las notas del usuario si existen. Responde en español y en formato Markdown.";
-            
-            let userQuery = "Analiza esta imagen de mi rostro para mejoras en la piel y consejos de belleza. ";
-            if (notes) {
-                userQuery += `Notas adicionales: ${notes}.`;
-            } else {
-                userQuery += "No hay notas adicionales.";
+            const apiKey = ""; 
+            const apiUrl = `${API_URL_TEXT}${apiKey}`;
+
+            const parts = [{ text: currentPrompt }];
+            if (imageBase64) {
+                parts.push({
+                    inlineData: {
+                        mimeType: "image/png", // Asumiendo que vamos a manejar PNG para consistencia
+                        data: imageBase64
+                    }
+                });
             }
 
-            const response = await generateMultimodalContent(systemPrompt, userQuery, base64Image);
-            setResult(response);
+            const payload = {
+                contents: [{ parts }],
+                systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
+                tools: enableSearch ? [{ "google_search": {} }] : undefined,
+            };
 
-        } catch (e) {
-            console.error("Error en el análisis de piel:", e);
-            setError(`Error al analizar la piel: ${e.message}`);
+            const response = await fetchWithBackoff(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No se pudo obtener respuesta de la IA.";
+            setAiResponse(text);
+
+        } catch (error) {
+            console.error("Error en la llamada a la API de Gemini:", error);
+            setAiResponse(`Error al procesar la solicitud: ${error.message}`);
         } finally {
-            setLoading(false);
+            setIsLoading(false);
         }
+    }, []);
+
+    // Función principal para manejar el envío de la herramienta
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        
+        let systemInstruction = "";
+        let finalPrompt = "";
+        let enableSearch = false;
+
+        switch (currentTool) {
+            case 'mealPlan':
+                systemInstruction = "Actúa como un dietista y planificador de comidas profesional. Genera un plan semanal conciso basado en la meta proporcionada. La respuesta debe ser solo texto Markdown, sin preámbulo.";
+                finalPrompt = `Genera un plan de comidas de 7 días (desayuno, almuerzo, cena) para esta meta: ${prompt}.`;
+                break;
+            case 'photoAnalysis':
+                if (!base64Image) {
+                    setAiResponse("Por favor, sube una imagen de tu plato para el análisis nutricional.");
+                    return;
+                }
+                systemInstruction = "Actúa como un analista nutricional. Basándote en la imagen de la comida, haz una estimación de los ingredientes principales, calorías aproximadas y una breve nota sobre su balance nutricional. Responde con un formato de lista en Markdown.";
+                finalPrompt = "Analiza esta comida y proporciona una estimación nutricional.";
+                break;
+            case 'symptomCheck':
+                systemInstruction = "Actúa como un asistente de salud informativa. Analiza los síntomas proporcionados y ofrece información general sobre posibles causas comunes y recomendaciones de estilo de vida. ADVERTENCIA: Nunca proporciones diagnósticos médicos. La respuesta debe ser cautelosa y en formato de lista en Markdown.";
+                finalPrompt = `Analiza los siguientes síntomas: ${prompt}`;
+                enableSearch = true;
+                break;
+            case 'progressTips':
+                systemInstruction = "Actúa como un entrenador personal y motivador. Analiza el historial de peso proporcionado y la meta del usuario para dar 3 consejos de progreso personalizados y un mensaje de motivación. La respuesta debe ser en formato de lista Markdown.";
+                
+                const progressSummary = weightData.length > 0
+                    ? `El usuario tiene ${weightData.length} registros. Su peso inicial fue ${weightData[0].weight}kg (en ${new Date(weightData[0].timestamp).toLocaleDateString('es-ES')}) y el último peso es ${weightData[weightData.length - 1].weight}kg (en ${new Date(weightData[weightData.length - 1].timestamp).toLocaleDateString('es-ES')}).`
+                    : "No hay historial de peso disponible. La meta es: " + prompt;
+
+                finalPrompt = `Analiza este historial y proporciona consejos de progreso basados en la meta: ${prompt}. Historial: ${progressSummary}`;
+                break;
+            default:
+                return;
+        }
+
+        await generateAIResponse(finalPrompt, currentTool === 'photoAnalysis' ? base64Image : null, systemInstruction, enableSearch);
     };
 
-    return (
-        <div className="bg-white p-6 rounded-xl shadow-2xl">
-            <h2 className="text-2xl font-bold mb-4 text-pink-700 border-b pb-2">Diario de Piel y Rostro IA</h2>
-            <p className="mb-4 text-gray-600">Sube una foto de tu rostro para obtener un análisis de progreso y consejos personalizados de cuidado de la piel y belleza.</p>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-                {/* Columna de Imagen */}
-                <div className="md:col-span-1 flex flex-col items-center p-4 border rounded-lg bg-gray-50">
-                    <img src={imagePreviewUrl} alt="Vista previa del rostro" className="w-32 h-32 object-cover rounded-full mb-3 border-4 border-pink-300 shadow-lg" />
+    // Renderizado del formulario de la herramienta activa
+    const renderForm = () => {
+        if (currentTool === 'photoAnalysis') {
+            return (
+                <div className="space-y-4">
+                    <label className="block text-sm font-medium text-gray-700">
+                        Sube una foto de tu comida:
+                    </label>
                     <input
                         type="file"
                         accept="image/png, image/jpeg"
                         onChange={handleImageChange}
-                        className="text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-pink-50 file:text-pink-700 hover:file:bg-pink-100"
+                        className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"
                     />
+                    <img 
+                        src={imagePreview} 
+                        alt="Previsualización de la comida" 
+                        className="w-full h-48 object-cover rounded-lg shadow-inner border border-gray-200"
+                    />
+                    <p className="text-sm text-gray-500">La IA analizará la imagen para darte un desglose nutricional estimado.</p>
                 </div>
+            );
+        }
 
-                {/* Columna de Notas y Botón */}
-                <div className="md:col-span-2 flex flex-col justify-between">
-                    <textarea
-                        placeholder="Notas sobre tu rutina de hoy o cambios que quieres que la IA observe..."
-                        value={notes}
-                        onChange={(e) => setNotes(e.target.value)}
-                        className="w-full p-3 border border-gray-300 rounded-lg mb-4 flex-grow h-full"
-                        rows={5}
-                    ></textarea>
-                     <button
-                        onClick={analyzeSkinImage}
-                        disabled={loading || !imageFile}
-                        className="bg-pink-500 text-white p-3 rounded-lg font-semibold hover:bg-pink-600 transition duration-150 disabled:bg-gray-400 shadow-md"
+        const placeholderText = {
+            mealPlan: 'Ej: "Quiero ganar 5kg de músculo en 3 meses" o "Necesito un plan para perder grasa".',
+            symptomCheck: 'Ej: "Dolor de cabeza leve, fatiga y dolor de garganta".',
+            progressTips: 'Ej: "Quiero mantener mi peso actual" o "Mi meta es correr un maratón".',
+        };
+
+        const titleText = {
+            mealPlan: 'Tu Meta Nutricional:',
+            symptomCheck: 'Tus Síntomas (No es Diagnóstico Médico):',
+            progressTips: 'Tu Próxima Meta o Desafío:',
+        };
+
+        return (
+            <div className="space-y-4">
+                <label htmlFor="prompt" className="block text-sm font-medium text-gray-700">
+                    {titleText[currentTool]}
+                </label>
+                <textarea
+                    id="prompt"
+                    rows="4"
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500"
+                    placeholder={placeholderText[currentTool]}
+                    required
+                ></textarea>
+            </div>
+        );
+    };
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
+            <h2 className="text-2xl font-bold text-indigo-800 mb-4 border-b pb-2">Herramientas de Salud con IA</h2>
+            
+            <div className="flex flex-wrap gap-2 mb-6">
+                {['mealPlan', 'photoAnalysis', 'symptomCheck', 'progressTips'].map((tool) => (
+                    <button
+                        key={tool}
+                        onClick={() => {
+                            setCurrentTool(tool);
+                            setAiResponse(null);
+                            setPrompt('');
+                            setBase64Image(null);
+                            setImagePreview(DEFAULT_IMAGE_URL);
+                        }}
+                        className={`px-4 py-2 text-sm font-semibold rounded-full transition duration-150 ${
+                            currentTool === tool 
+                                ? 'bg-indigo-500 text-white shadow-md' 
+                                : 'bg-gray-100 text-gray-700 hover:bg-indigo-50'
+                        }`}
                     >
-                        {loading ? <Spinner /> : "Analizar Rostro y Dar Consejos"}
+                        {tool === 'mealPlan' && 'Planificador de Comidas'}
+                        {tool === 'photoAnalysis' && 'Análisis de Foto'}
+                        {tool === 'symptomCheck' && 'Analizador de Síntomas'}
+                        {tool === 'progressTips' && 'Consejos de Progreso'}
                     </button>
-                </div>
+                ))}
             </div>
 
-            {/* Resultado de la IA */}
-            <div className="mt-6">
-                {error && <div className="text-red-500 bg-red-100 p-3 rounded-lg border border-red-200">{error}</div>}
-                {loading && <div className="flex justify-center py-4"><Spinner /></div>}
-                {result && (
-                    <div className="bg-pink-50 border border-pink-200 p-4 rounded-lg shadow-inner whitespace-pre-wrap">
-                        <h3 className="text-lg font-semibold mb-2 text-pink-700">Informe de Belleza IA:</h3>
-                        {result}
+            <form onSubmit={handleSubmit} className="space-y-6">
+                {renderForm()}
+                <button
+                    type="submit"
+                    disabled={isLoading || (currentTool !== 'photoAnalysis' && !prompt) || (currentTool === 'photoAnalysis' && !base64Image)}
+                    className="w-full px-6 py-3 bg-green-500 text-white font-semibold rounded-lg shadow-md hover:bg-green-600 transition duration-150 disabled:opacity-50"
+                >
+                    {isLoading ? (
+                        <span className="flex items-center justify-center">
+                            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            Analizando...
+                        </span>
+                    ) : (
+                        'Consultar a la IA'
+                    )}
+                </button>
+            </form>
+            
+            {aiResponse && (
+                <div className="mt-8 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                    <h3 className="text-xl font-semibold text-gray-800 mb-3">Respuesta de la IA</h3>
+                    <div className="prose max-w-none text-gray-700">
+                        {/* Renderizar respuesta de la IA (puedes usar una librería de Markdown si la tuvieras) */}
+                        <pre className="whitespace-pre-wrap font-sans text-sm">{aiResponse}</pre>
                     </div>
-                )}
-            </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+// Componente de Diario de Piel (Skin)
+const SkinJournal = ({ generateAIResponse }) => {
+    const [aiResponse, setAiResponse] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [base64Image, setBase64Image] = useState(null);
+    const [imagePreview, setImagePreview] = useState(DEFAULT_IMAGE_URL);
+    const [prompt, setPrompt] = useState('');
+
+    const handleImageChange = (event) => {
+        const file = event.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const base64 = reader.result.split(',')[1];
+                setBase64Image(base64);
+                setImagePreview(reader.result);
+            };
+            reader.readAsDataURL(file);
+        } else {
+            setBase64Image(null);
+            setImagePreview(DEFAULT_IMAGE_URL);
+        }
+    };
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!base64Image) {
+            setAiResponse("Por favor, sube una foto de tu rostro para el análisis.");
+            return;
+        }
+        
+        setIsLoading(true);
+        setAiResponse(null);
+
+        const systemInstruction = "Actúa como un experto en cuidado de la piel (skincare). Analiza la imagen del rostro proporcionada, identifica problemas comunes (como acné, enrojecimiento, sequedad o brillo) y ofrece una rutina básica de cuidado con sugerencias de ingredientes clave. La respuesta debe ser estructurada en Markdown (Análisis, Rutina Sugerida, Ingredientes Clave).";
+        const finalPrompt = `Analiza la imagen del rostro. El usuario proporciona la siguiente información adicional: ${prompt || 'Ninguna'}. Genera el análisis de la piel.`;
+        
+        await generateAIResponse(finalPrompt, base64Image, systemInstruction);
+
+        setIsLoading(false);
+    };
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
+            <h2 className="text-2xl font-bold text-pink-700 mb-4 border-b pb-2">Analizador de Rostro con IA</h2>
+            <p className="text-gray-600 mb-6">Sube una foto de tu rostro (con buena iluminación) y describe tu rutina actual o preocupaciones para recibir un análisis de piel personalizado y sugerencias de rutina.</p>
+
+            <form onSubmit={handleSubmit} className="space-y-6">
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <label htmlFor="skinImage" className="block text-sm font-medium text-gray-700">
+                            Sube una foto de tu rostro:
+                        </label>
+                        <input
+                            type="file"
+                            id="skinImage"
+                            accept="image/png, image/jpeg"
+                            onChange={handleImageChange}
+                            className="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-pink-50 file:text-pink-700 hover:file:bg-pink-100"
+                        />
+                        <img 
+                            src={imagePreview} 
+                            alt="Previsualización del rostro" 
+                            className="w-full h-64 object-cover rounded-lg shadow-inner border border-gray-200 mt-4"
+                        />
+                    </div>
+                    <div>
+                        <label htmlFor="skinPrompt" className="block text-sm font-medium text-gray-700">
+                            Describe tu rutina o preocupaciones (opcional):
+                        </label>
+                        <textarea
+                            id="skinPrompt"
+                            rows="7"
+                            value={prompt}
+                            onChange={(e) => setPrompt(e.target.value)}
+                            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-3 focus:ring-pink-500 focus:border-pink-500"
+                            placeholder="Ej: Tengo piel grasa y propensa al acné. Actualmente uso un limpiador y un hidratante simple."
+                        ></textarea>
+                    </div>
+                </div>
+
+                <button
+                    type="submit"
+                    disabled={isLoading || !base64Image}
+                    className="w-full px-6 py-3 bg-pink-600 text-white font-semibold rounded-lg shadow-md hover:bg-pink-700 transition duration-150 disabled:opacity-50"
+                >
+                    {isLoading ? (
+                        <span className="flex items-center justify-center">
+                            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            Analizando Rostro...
+                        </span>
+                    ) : (
+                        'Obtener Análisis de Piel con IA'
+                    )}
+                </button>
+            </form>
+
+            {aiResponse && (
+                <div className="mt-8 p-4 bg-pink-50 rounded-lg border border-pink-200">
+                    <h3 className="text-xl font-semibold text-pink-800 mb-3">Diagnóstico y Rutina Sugerida</h3>
+                    <div className="prose max-w-none text-gray-700">
+                        <pre className="whitespace-pre-wrap font-sans text-sm">{aiResponse}</pre>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
 
 
-// --- COMPONENTE PRINCIPAL APP ---
+// --- COMPONENTE PRINCIPAL (APP) ---
 
 const App = () => {
-    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [dbInstance, setDbInstance] = useState(null);
+    const [authInstance, setAuthInstance] = useState(null);
     const [userId, setUserId] = useState(null);
-    const [weightData, setWeightData] = useState([]);
-    const [db, setDb] = useState(null);
-    const [auth, setAuth] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
     const [activeTab, setActiveTab] = useState('home');
+    const [weightData, setWeightData] = useState([]);
 
     // 1. Inicialización de Firebase y Autenticación
     useEffect(() => {
-        if (!firebaseConfig.apiKey) {
-            console.error("Firebase no está configurado. La aplicación no funcionará correctamente.");
-            setIsAuthReady(true); // Permitir que la UI cargue aunque sin conexión a DB
-            return;
-        }
+        if (!app || !auth || !db) return;
 
-        try {
-            const app = initializeApp(firebaseConfig);
-            const firestore = getFirestore(app);
-            const authentication = getAuth(app);
-            
-            setDb(firestore);
-            setAuth(authentication);
-            dbContext.app = app;
-            dbContext.db = firestore;
-            dbContext.auth = authentication;
+        setDbInstance(db);
+        setAuthInstance(auth);
 
-            const authenticate = async () => {
-                // Usar token personalizado si está disponible, sino autenticación anónima
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+                setIsAuthReady(true);
+            } else if (initialAuthToken) {
                 try {
-                    if (initialAuthToken) {
-                        await signInWithCustomToken(authentication, initialAuthToken);
-                    } else {
-                        await signInAnonymously(authentication);
-                    }
-                } catch (e) {
-                    console.error("Error en signInWithCustomToken, intentando anónimo:", e);
-                    // Fallback a anónimo si falla el token (permisos/expiración)
-                    await signInAnonymously(authentication);
+                    // Intenta iniciar sesión con el token personalizado de Canvas
+                    const userCredential = await signInWithCustomToken(auth, initialAuthToken);
+                    setUserId(userCredential.user.uid);
+                } catch (error) {
+                    console.error("Error al iniciar sesión con token personalizado:", error);
+                    // Si falla, cae a anónimo
+                    await signInAnonymously(auth);
+                } finally {
+                    setIsAuthReady(true);
                 }
-            };
-
-            // Asegura que el estado de autenticación se maneje
-            const unsubscribe = onAuthStateChanged(authentication, (user) => {
-                let currentUserId;
-                if (user) {
-                    currentUserId = user.uid;
-                } else {
-                    // Esto solo debería pasar si la autenticación falla por completo, usamos un UUID
-                    currentUserId = crypto.randomUUID();
+            } else {
+                // Si no hay token personalizado, usa anónimo
+                try {
+                    const userCredential = await signInAnonymously(auth);
+                    setUserId(userCredential.user.uid);
+                } catch (error) {
+                    console.error("Error al iniciar sesión anónimamente:", error);
+                    setUserId('anonymous-error');
+                } finally {
+                    setIsAuthReady(true);
                 }
-                setUserId(currentUserId);
-                dbContext.userId = currentUserId;
-                // NOTA: isAuthReady se establece una vez que onAuthStateChanged ha dado un resultado, 
-                // asegurando que tenemos un userId (ya sea real o fallback).
-                setIsAuthReady(true);
-            });
-
-            // Llama a authenticate y maneja el estado
-            authenticate().catch(e => {
-                console.error("Error al completar la autenticación, UI cargará con UUID:", e);
-                // Asegurar que setIsAuthReady se llama incluso si falla.
-                setIsAuthReady(true);
-            });
-
-            return () => unsubscribe();
-
-        } catch (e) {
-            console.error("Error al inicializar Firebase:", e);
-            setIsAuthReady(true);
-        }
-    }, []);
-
-    // 2. Suscripción a datos de peso (Firestore Listener)
-    useEffect(() => {
-        // CORRECCIÓN DE ERRORES DE PERMISOS: Añadimos una comprobación estricta para asegurar
-        // que la autenticación ha finalizado y el usuario (auth.currentUser) exista antes 
-        // de intentar configurar el listener de Firestore.
-
-        if (!db || !userId || !isAuthReady || !auth || !auth.currentUser) {
-            console.log("Listener skip: DB, UserID, AuthReady, o currentUser no listos.");
-            return;
-        }
-        
-        // El userId ya está sincronizado con el user.uid de onAuthStateChanged
-        const authenticatedUserId = userId; 
-
-        console.log(`Setting up listener for user: ${authenticatedUserId}`);
-        
-        // Path para datos privados: /artifacts/{appId}/users/{userId}/{collectionName}
-        const weightsRef = collection(db, `artifacts/${appId}/users/${authenticatedUserId}/weights`);
-        // Se mantiene la consulta sin orderBy
-        const q = query(weightsRef); 
-
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const weights = [];
-            snapshot.forEach((doc) => {
-                weights.push(doc.data());
-            });
-            // Ordenamos los datos en la memoria del cliente (Javascript)
-            setWeightData(weights.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)));
-        }, (error) => {
-            // Este es el manejador de errores que capturó el error de permisos.
-            // Lo logueamos pero evitamos un crash completo de la app.
-            console.error("Error al escuchar los datos de peso:", error);
-            setWeightData([]);
+            }
         });
 
         return () => unsubscribe();
-    }, [db, userId, isAuthReady, auth]); // Dependencias estrictas: auth added
-
-    const handleNewWeightRecord = useCallback((newWeight) => {
-        // La suscripción a onSnapshot se encargará de actualizar weightData.
-        console.log("Nuevo peso registrado:", newWeight);
     }, []);
-    
+
+    // 2. Escucha de Datos de Firestore (Peso)
+    useEffect(() => {
+        // Ejecutar solo si Firebase está listo, la autenticación ha finalizado y tenemos un userId
+        if (!dbInstance || !userId || !isAuthReady || !authInstance.currentUser) {
+            return;
+        }
+
+        const q = query(
+            collection(dbInstance, `artifacts/${appId}/users/${userId}/weights`)
+        );
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const data = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            
+            // Ordenar los datos en el cliente por timestamp (descendente)
+            const sortedData = data.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+            
+            setWeightData(sortedData);
+        }, (error) => {
+            // Este es el error que típicamente ocurre si el índice o los permisos son incorrectos.
+            console.error("Error al escuchar los datos de peso:", error);
+        });
+
+        return () => unsubscribe();
+    }, [dbInstance, userId, isAuthReady, authInstance]);
+
 
     const renderContent = () => {
-        if (!isAuthReady) {
+        const commonProps = { userId, db: dbInstance, isAuthReady, generateAIResponse: AITools.generateAIResponse };
+
+        if (activeTab === 'home') {
             return (
-                <div className="text-center p-10">
-                    <Spinner />
-                    <p className="mt-4 text-gray-600">Cargando aplicación y autenticando usuario...</p>
+                <div className="space-y-8">
+                    <WeightTracker {...commonProps} weightData={weightData} />
+                    <AITools {...commonProps} weightData={weightData} />
                 </div>
             );
+        } else if (activeTab === 'skin') {
+            return <SkinJournal {...commonProps} />;
         }
-        
-        switch (activeTab) {
-            case 'home':
-                return (
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 p-6">
-                        <RecordWeight db={db} userId={userId} onRecord={handleNewWeightRecord} />
-                        <WeightHistory weightData={weightData} />
-                        <div className="lg:col-span-2">
-                           <AiTools weightData={weightData} />
-                        </div>
-                    </div>
-                );
-            case 'skin':
-                return (
-                    <div className="p-6">
-                        <SkinAnalysisTool />
-                    </div>
-                );
-            default:
-                return null;
-        }
+        return null;
     };
 
     return (
-        <div className="min-h-screen bg-gray-100 font-sans">
-            <header className="bg-white shadow-md p-4 flex justify-between items-center">
-                <h1 className="text-3xl font-extrabold text-indigo-800">
-                    Health IA Tracker
-                </h1>
-                <div className="flex space-x-4">
-                    <button
-                        onClick={() => setActiveTab('home')}
-                        className={`py-2 px-4 rounded-lg font-medium transition duration-150 
-                            ${activeTab === 'home' 
-                                ? 'bg-indigo-600 text-white shadow-lg' 
-                                : 'text-indigo-600 hover:bg-indigo-50'}`
-                        }
-                    >
-                        Registro & Nutrición
-                    </button>
-                    <button
-                        onClick={() => setActiveTab('skin')}
-                        className={`py-2 px-4 rounded-lg font-medium transition duration-150 
-                            ${activeTab === 'skin' 
-                                ? 'bg-pink-600 text-white shadow-lg' 
-                                : 'text-pink-600 hover:bg-pink-50'}`
-                        }
-                    >
-                        Diario de Piel
-                    </button>
+        <div className="min-h-screen bg-gray-50 font-sans">
+            <header className="bg-white shadow-md p-4 sticky top-0 z-10">
+                <div className="max-w-4xl mx-auto flex flex-col sm:flex-row justify-between items-center space-y-4 sm:space-y-0">
+                    <h1 className="text-2xl font-extrabold text-gray-800">
+                        Health IA Tracker
+                    </h1>
+                    
+                    <div className="flex space-x-4">
+                        <button
+                            onClick={() => setActiveTab('home')}
+                            className={`py-2 px-4 rounded-lg font-medium transition duration-150 
+                                ${activeTab === 'home' 
+                                    ? 'bg-indigo-600 text-white shadow-lg' 
+                                    : 'text-indigo-600 hover:bg-indigo-50'}`
+                            }
+                        >
+                            Registro & Nutrición
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('skin')}
+                            className={`py-2 px-4 rounded-lg font-medium transition duration-150 
+                                ${activeTab === 'skin' 
+                                    ? 'bg-pink-600 text-white shadow-lg' 
+                                    : 'text-pink-600 hover:bg-pink-50'}`
+                            }
+                        >
+                            Diario de Piel
+                        </button>
+                    </div>
                 </div>
             </header>
 
-            <main className="max-w-4xl mx-auto py-8">
+            <main className="max-w-4xl mx-auto py-8 px-4 sm:px-0">
                 {renderContent()}
             </main>
 
@@ -822,8 +648,52 @@ const App = () => {
     );
 };
 
-// --- LÓGICA DE MONTAJE (Ajuste para entorno Canvas) ---
-// Se elimina la lógica de montaje explícita que causaba el conflicto.
-// El componente principal debe ser el export por defecto para que el entorno lo monte.
+// Se asegura que la función de generación de IA esté disponible para el SkinJournal
+AITools.generateAIResponse = (prompt, base64Image, systemInstruction, enableSearch) => {
+    // Esta función es una copia simplificada de la lógica interna de AITools 
+    // para ser pasada a otros componentes que la necesiten.
+    const runGeneration = async (setAiResponse, setIsLoading) => {
+        setIsLoading(true);
+        setAiResponse(null);
+
+        try {
+            const apiKey = ""; 
+            const apiUrl = `${API_URL_TEXT}${apiKey}`;
+
+            const parts = [{ text: prompt }];
+            if (base64Image) {
+                parts.push({
+                    inlineData: {
+                        mimeType: "image/png", 
+                        data: base64Image
+                    }
+                });
+            }
+
+            const payload = {
+                contents: [{ parts }],
+                systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
+                tools: enableSearch ? [{ "google_search": {} }] : undefined,
+            };
+
+            const response = await fetchWithBackoff(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No se pudo obtener respuesta de la IA.";
+            setAiResponse(text);
+
+        } catch (error) {
+            console.error("Error en la llamada a la API de Gemini (Passthrough):", error);
+            setAiResponse(`Error al procesar la solicitud: ${error.message}`);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+    return runGeneration;
+};
 
 export default App;
