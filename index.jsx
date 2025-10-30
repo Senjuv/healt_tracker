@@ -9,7 +9,8 @@ import {
     onSnapshot, collection, query, 
 } from 'firebase/firestore';
 
-// --- CONFIGURACIÓN DE FIREBASE Y VARIABLES GLOBALES ---
+// --- CONFIGURACIÓN DE FIREBASE Y VARIABLES GLOBALES (Necesarias para el entorno) ---
+// La configuración se obtiene de variables de entorno del Canvas.
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-health-app';
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
@@ -17,594 +18,705 @@ const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial
 const API_MODEL_TEXT = "gemini-2.5-flash-preview-09-2025";
 const API_URL_TEXT = `https://generativelanguage.googleapis.com/v1beta/models/${API_MODEL_TEXT}:generateContent?key=`;
 
-const DEFAULT_IMAGE_URL = "https://placehold.co/300x200/222/fff?text=Carga+tu+Imagen";
+// URL para el placeholder de carga de imagen/documento
+const DEFAULT_IMAGE_URL = "https://placehold.co/400x300/e0e7ff/6366f1?text=Subir+Imagen";
 
-// --- INICIALIZACIÓN DE FIREBASE ---
-let app;
-let db;
-let auth;
-if (Object.keys(firebaseConfig).length > 0) {
-    app = initializeApp(firebaseConfig);
-    db = getFirestore(app);
-    auth = getAuth(app);
-}
+// --- UTILIDADES ---
 
-// Función para simular la lógica de exponential backoff y fetch
-const fetchWithBackoff = async (url, options) => {
-    let lastError = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-            const response = await fetch(url, options);
-            if (!response.ok) {
-                // Manejar error de HTTP
-                const errorBody = await response.json();
-                throw new Error(`HTTP error! status: ${response.status}. Details: ${JSON.stringify(errorBody)}`);
-            }
-            return response;
-        } catch (error) {
-            lastError = error;
-            console.error(`Attempt ${attempt + 1} failed:`, error.message);
-            if (attempt < 2) {
-                // Esperar 2^attempt segundos
-                const delay = Math.pow(2, attempt) * 1000;
-                await new Promise(resolve => setTimeout(resolve, delay));
-            }
-        }
-    }
-    throw new Error(`Failed after multiple retries: ${lastError.message}`);
-};
-
-
-// --- COMPONENTES DE LA APLICACIÓN ---
-
-// Componente para la entrada de peso y el gráfico
-const WeightTracker = ({ userId, db, isAuthReady, weightData }) => {
-    const [currentWeight, setCurrentWeight] = useState('');
-    const [saveMessage, setSaveMessage] = useState('');
-
-    const handleSaveWeight = async () => {
-        if (!db || !userId || !currentWeight) {
-            setSaveMessage('Error: Faltan datos de usuario o peso.');
-            return;
-        }
-        
-        const weightValue = parseFloat(currentWeight);
-        if (isNaN(weightValue) || weightValue <= 0) {
-            setSaveMessage('Por favor, ingresa un peso válido.');
-            return;
-        }
-
-        try {
-            const timestamp = new Date().toISOString();
-            // Usamos el timestamp como ID de documento para asegurar un orden único y natural
-            const docRef = doc(db, `artifacts/${appId}/users/${userId}/weights`, timestamp);
-            
-            await setDoc(docRef, {
-                weight: weightValue,
-                timestamp: timestamp,
-                date: new Date().toLocaleDateString('es-ES'),
-            });
-            
-            setSaveMessage('¡Peso guardado con éxito!');
-            setCurrentWeight('');
-            setTimeout(() => setSaveMessage(''), 3000);
-        } catch (error) {
-            console.error("Error al guardar el peso:", error);
-            setSaveMessage(`Error al guardar: ${error.message}`);
-        }
-    };
-
-    // La data ya viene ordenada del useEffect principal
-    const sortedData = weightData; 
-
-    const totalEntries = sortedData.length;
-    const initialWeight = totalEntries > 0 ? sortedData[0].weight : 0;
-    const latestWeight = totalEntries > 0 ? sortedData[totalEntries - 1].weight : 0;
-    const change = latestWeight - initialWeight;
-
-    return (
-        <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100 mb-8">
-            <h2 className="text-2xl font-bold text-indigo-800 mb-4 border-b pb-2">Registro de Peso</h2>
-            
-            <div className="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-6 items-start sm:items-end mb-6">
-                <div className="flex-1 w-full">
-                    <label htmlFor="weight" className="block text-sm font-medium text-gray-700">
-                        Peso Actual (kg):
-                    </label>
-                    <input
-                        type="number"
-                        id="weight"
-                        value={currentWeight}
-                        onChange={(e) => setCurrentWeight(e.target.value)}
-                        className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500"
-                        placeholder="Ej. 75.5"
-                        min="1"
-                    />
-                </div>
-                <button
-                    onClick={handleSaveWeight}
-                    disabled={!isAuthReady || !currentWeight}
-                    className="w-full sm:w-auto px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition duration-150 disabled:opacity-50"
-                >
-                    Guardar Peso
-                </button>
-            </div>
-            
-            {saveMessage && (
-                <p className={`text-sm font-semibold ${saveMessage.includes('Error') ? 'text-red-500' : 'text-green-600'} mt-2`}>
-                    {saveMessage}
-                </p>
-            )}
-
-            <div className="mt-6 p-4 bg-indigo-50 rounded-lg">
-                <h3 className="text-lg font-semibold text-indigo-700 mb-3">Tu Progreso</h3>
-                <div className="flex justify-between items-center text-sm font-medium">
-                    <span>Entradas Totales:</span>
-                    <span className="text-gray-900">{totalEntries}</span>
-                </div>
-                <div className="flex justify-between items-center text-sm font-medium mt-1">
-                    <span>Peso Inicial:</span>
-                    <span className="text-gray-900">{initialWeight > 0 ? `${initialWeight} kg` : 'N/A'}</span>
-                </div>
-                <div className="flex justify-between items-center text-sm font-medium mt-1">
-                    <span>Peso Más Reciente:</span>
-                    <span className="text-gray-900">{latestWeight > 0 ? `${latestWeight} kg` : 'N/A'}</span>
-                </div>
-                <div className="flex justify-between items-center text-sm font-medium mt-2 pt-2 border-t border-indigo-200">
-                    <span>Cambio Total:</span>
-                    <span className={`font-bold ${change > 0 ? 'text-red-500' : change < 0 ? 'text-green-600' : 'text-gray-500'}`}>
-                        {change > 0 ? `+${change.toFixed(1)} kg` : change.toFixed(1) + ' kg'}
-                    </span>
-                </div>
-            </div>
-        </div>
-    );
-};
-
-// Función de generación de IA
-const generateAIResponse = async (currentPrompt, imageBase64, systemInstruction, enableSearch, setAiResponse, setIsLoading) => {
-    setIsLoading(true);
-    setAiResponse(null);
-
+// Función de retardo exponencial para reintentos de API
+const fetchWithBackoff = async (url, options, retries = 3, delay = 1000) => {
     try {
-        const apiKey = ""; 
-        const apiUrl = `${API_URL_TEXT}${apiKey}`;
-
-        const parts = [{ text: currentPrompt }];
-        if (imageBase64) {
-            parts.push({
-                inlineData: {
-                    mimeType: "image/png", // Asumiendo que vamos a manejar PNG para consistencia
-                    data: imageBase64
-                }
-            });
+        const response = await fetch(url, options);
+        if (response.status === 429 && retries > 0) {
+            console.warn(`429 Rate Limit. Retrying in ${delay / 1000}s...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return fetchWithBackoff(url, options, retries - 1, delay * 2);
         }
-
-        const payload = {
-            contents: [{ parts }],
-            systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
-            tools: enableSearch ? [{ "google_search": {} }] : undefined,
-        };
-
-        const response = await fetchWithBackoff(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-
-        const result = await response.json();
-        const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No se pudo obtener respuesta de la IA.";
-        setAiResponse(text);
-
+        if (!response.ok) {
+             const errorBody = await response.text();
+             throw new Error(`API call failed: ${response.status} - ${errorBody}`);
+        }
+        return response;
     } catch (error) {
-        console.error("Error en la llamada a la API de Gemini:", error);
-        setAiResponse(`Error al procesar la solicitud: ${error.message}`);
-    } finally {
-        setIsLoading(false);
+        if (retries > 0 && error.message.includes('API call failed: 5')) { // Retry on 5xx errors too
+            console.warn(`Server Error. Retrying in ${delay / 1000}s...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return fetchWithBackoff(url, options, retries - 1, delay * 2);
+        }
+        throw error;
     }
 };
 
 
-// Componente para las herramientas de IA
-const AITools = ({ userId, weightData, db }) => {
-    const [aiResponse, setAiResponse] = useState(null);
+// Hook para la generación de contenido con la API de Gemini
+const useGeminiGenerator = () => {
     const [isLoading, setIsLoading] = useState(false);
-    const [currentTool, setCurrentTool] = useState('mealPlan');
-    const [prompt, setPrompt] = useState('');
-    const [base64Image, setBase64Image] = useState(null);
-    const [imagePreview, setImagePreview] = useState(DEFAULT_IMAGE_URL);
-
-    // Función para manejar la subida de imagen y convertirla a Base64
-    const handleImageChange = (event) => {
-        const file = event.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                const base64 = reader.result.split(',')[1];
-                setBase64Image(base64);
-                setImagePreview(reader.result);
-            };
-            reader.readAsDataURL(file);
-        } else {
-            setBase64Image(null);
-            setImagePreview(DEFAULT_IMAGE_URL);
-        }
-    };
-
-    // Función principal para manejar el envío de la herramienta
-    const handleSubmit = async (e) => {
-        e.preventDefault();
-        
-        let systemInstruction = "";
-        let finalPrompt = "";
-        let enableSearch = false;
-        let imageToSend = null;
-
-        switch (currentTool) {
-            case 'mealPlan':
-                systemInstruction = "Actúa como un dietista y planificador de comidas profesional. Genera un plan semanal conciso basado en la meta proporcionada. La respuesta debe ser solo texto Markdown, sin preámbulo.";
-                finalPrompt = `Genera un plan de comidas de 7 días (desayuno, almuerzo, cena) para esta meta: ${prompt}.`;
-                break;
-            case 'photoAnalysis':
-                if (!base64Image) {
-                    setAiResponse("Por favor, sube una imagen de tu plato para el análisis nutricional.");
-                    return;
-                }
-                systemInstruction = "Actúa como un analista nutricional. Basándote en la imagen de la comida, haz una estimación de los ingredientes principales, calorías aproximadas y una breve nota sobre su balance nutricional. Responde con un formato de lista en Markdown.";
-                finalPrompt = "Analiza esta comida y proporciona una estimación nutricional.";
-                imageToSend = base64Image;
-                break;
-            case 'symptomCheck':
-                systemInstruction = "Actúa como un asistente de salud informativa. Analiza los síntomas proporcionados y ofrece información general sobre posibles causas comunes y recomendaciones de estilo de vida. ADVERTENCIA: Nunca proporciones diagnósticos médicos. La respuesta debe ser cautelosa y en formato de lista en Markdown.";
-                finalPrompt = `Analiza los siguientes síntomas: ${prompt}`;
-                enableSearch = true;
-                break;
-            case 'progressTips':
-                systemInstruction = "Actúa como un entrenador personal y motivador. Analiza el historial de peso proporcionado y la meta del usuario para dar 3 consejos de progreso personalizados y un mensaje de motivación. La respuesta debe ser en formato de lista Markdown.";
-                
-                const progressSummary = weightData.length > 0
-                    ? `El usuario tiene ${weightData.length} registros. Su peso inicial fue ${weightData[0].weight}kg (en ${new Date(weightData[0].timestamp).toLocaleDateString('es-ES')}) y el último peso es ${weightData[weightData.length - 1].weight}kg (en ${new Date(weightData[weightData.length - 1].timestamp).toLocaleDateString('es-ES')}).`
-                    : "No hay historial de peso disponible. La meta es: " + prompt;
-
-                finalPrompt = `Analiza este historial y proporciona consejos de progreso basados en la meta: ${prompt}. Historial: ${progressSummary}`;
-                break;
-            default:
-                return;
-        }
-
-        await generateAIResponse(finalPrompt, imageToSend, systemInstruction, enableSearch, setAiResponse, setIsLoading);
-    };
-
-    // Renderizado del formulario de la herramienta activa
-    const renderForm = () => {
-        if (currentTool === 'photoAnalysis') {
-            return (
-                <div className="space-y-4">
-                    <label className="block text-sm font-medium text-gray-700">
-                        Sube una foto de tu plato para el análisis nutricional:
-                    </label>
-                    <input
-                        type="file"
-                        accept="image/png, image/jpeg"
-                        onChange={handleImageChange}
-                        className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"
-                    />
-                    <img 
-                        src={imagePreview} 
-                        alt="Previsualización de la comida" 
-                        className="w-full h-48 object-cover rounded-lg shadow-inner border border-gray-200"
-                    />
-                    <p className="text-sm text-gray-500">La IA analizará la imagen para darte un desglose nutricional estimado.</p>
-                </div>
-            );
-        }
-
-        const placeholderText = {
-            mealPlan: 'Ej: "Quiero ganar 5kg de músculo en 3 meses" o "Necesito un plan para perder grasa".',
-            symptomCheck: 'Ej: "Dolor de cabeza leve, fatiga y dolor de garganta".',
-            progressTips: 'Ej: "Quiero mantener mi peso actual" o "Mi meta es correr un maratón".',
-        };
-
-        const titleText = {
-            mealPlan: 'Tu Meta Nutricional:',
-            symptomCheck: 'Tus Síntomas (No es Diagnóstico Médico):',
-            progressTips: 'Tu Próxima Meta o Desafío:',
-        };
-
-        return (
-            <div className="space-y-4">
-                <label htmlFor="prompt" className="block text-sm font-medium text-gray-700">
-                    {titleText[currentTool]}
-                </label>
-                <textarea
-                    id="prompt"
-                    rows="4"
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                    className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500"
-                    placeholder={placeholderText[currentTool]}
-                    required
-                ></textarea>
-            </div>
-        );
-    };
-
-    return (
-        <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
-            <h2 className="text-2xl font-bold text-indigo-800 mb-4 border-b pb-2">Herramientas de Salud con IA</h2>
-            
-            <div className="flex flex-wrap gap-2 mb-6">
-                {['mealPlan', 'photoAnalysis', 'symptomCheck', 'progressTips'].map((tool) => (
-                    <button
-                        key={tool}
-                        onClick={() => {
-                            setCurrentTool(tool);
-                            setAiResponse(null);
-                            setPrompt('');
-                            setBase64Image(null);
-                            setImagePreview(DEFAULT_IMAGE_URL);
-                        }}
-                        className={`px-4 py-2 text-sm font-semibold rounded-full transition duration-150 
-                            ${currentTool === tool 
-                                ? 'bg-indigo-500 text-white shadow-md' 
-                                : 'bg-gray-100 text-gray-700 hover:bg-indigo-50'
-                            }`
-                        }
-                    >
-                        {tool === 'mealPlan' && 'Planificador de Comidas'}
-                        {tool === 'photoAnalysis' && 'Análisis de Foto'}
-                        {tool === 'symptomCheck' && 'Analizador de Síntomas'}
-                        {tool === 'progressTips' && 'Consejos de Progreso'}
-                    </button>
-                ))}
-            </div>
-
-            <form onSubmit={handleSubmit} className="space-y-6">
-                {renderForm()}
-                <button
-                    type="submit"
-                    disabled={isLoading || (currentTool !== 'photoAnalysis' && !prompt) || (currentTool === 'photoAnalysis' && !base64Image)}
-                    className="w-full px-6 py-3 bg-green-500 text-white font-semibold rounded-lg shadow-md hover:bg-green-600 transition duration-150 disabled:opacity-50"
-                >
-                    {isLoading ? (
-                        <span className="flex items-center justify-center">
-                            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                            </svg>
-                            Analizando...
-                        </span>
-                    ) : (
-                        'Consultar a la IA'
-                    )}
-                </button>
-            </form>
-            
-            {aiResponse && (
-                <div className="mt-8 p-4 bg-gray-50 rounded-lg border border-gray-200">
-                    <h3 className="text-xl font-semibold text-gray-800 mb-3">Respuesta de la IA</h3>
-                    <div className="prose max-w-none text-gray-700">
-                        {/* El uso de <pre> es simple pero efectivo para mostrar la respuesta en Markdown */}
-                        <pre className="whitespace-pre-wrap font-sans text-sm">{aiResponse}</pre>
-                    </div>
-                </div>
-            )}
-        </div>
-    );
-};
-
-// Componente de Diario de Piel (Skin)
-const SkinJournal = () => {
     const [aiResponse, setAiResponse] = useState(null);
-    const [isLoading, setIsLoading] = useState(false);
-    const [base64Image, setBase64Image] = useState(null);
-    const [imagePreview, setImagePreview] = useState(DEFAULT_IMAGE_URL);
-    const [prompt, setPrompt] = useState('');
 
-    const handleImageChange = (event) => {
-        const file = event.target.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                const base64 = reader.result.split(',')[1];
-                setBase64Image(base64);
-                setImagePreview(reader.result);
+    const runGeneration = async ({ prompt, base64Image, systemInstruction, enableSearch = false }) => {
+        if (!prompt) return;
+
+        setIsLoading(true);
+        setAiResponse(null);
+
+        try {
+            const apiKey = ""; 
+            const apiUrl = `${API_URL_TEXT}${apiKey}`;
+
+            const parts = [{ text: prompt }];
+            if (base64Image) {
+                // Asumiendo que base64Image incluye el prefijo mimeType (e.g., data:image/png;base64,...)
+                // Si solo es el data puro, ajustar mimeType. Aquí asumimos que es data:image/png;base64,...
+                const [mimeTypePrefix, base64Data] = base64Image.split(',');
+                const mimeTypeMatch = mimeTypePrefix.match(/data:(.*?);base64/);
+                const mimeType = mimeTypeMatch ? mimeTypeMatch[1] : "image/jpeg"; // Default to jpeg if parsing fails
+
+                parts.push({
+                    inlineData: {
+                        mimeType: mimeType, 
+                        data: base64Data
+                    }
+                });
+            }
+
+            const payload = {
+                contents: [{ parts }],
+                systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
+                tools: enableSearch ? [{ "google_search": {} }] : undefined,
             };
-            reader.readAsDataURL(file);
-        } else {
-            setBase64Image(null);
-            setImagePreview(DEFAULT_IMAGE_URL);
+
+            const response = await fetchWithBackoff(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No se pudo obtener respuesta de la IA.";
+            setAiResponse(text);
+
+        } catch (error) {
+            console.error("Error en la llamada a la API de Gemini:", error);
+            setAiResponse(`Error al procesar la solicitud: ${error.message}`);
+        } finally {
+            setIsLoading(false);
         }
     };
-
-    const handleSubmit = async (e) => {
-        e.preventDefault();
-        if (!base64Image) {
-            setAiResponse("Por favor, sube una foto de tu rostro para el análisis.");
-            return;
-        }
-        
-        const systemInstruction = "Actúa como un experto en cuidado de la piel (skincare). Analiza la imagen del rostro proporcionada, identifica problemas comunes (como acné, enrojecimiento, sequedad o brillo) y ofrece una rutina básica de cuidado con sugerencias de ingredientes clave. La respuesta debe ser estructurada en Markdown (Análisis, Rutina Sugerida, Ingredientes Clave).";
-        const finalPrompt = `Analiza la imagen del rostro. El usuario proporciona la siguiente información adicional: ${prompt || 'Ninguna'}. Genera el análisis de la piel.`;
-        
-        await generateAIResponse(finalPrompt, base64Image, systemInstruction, false, setAiResponse, setIsLoading);
-    };
-
-    return (
-        <div className="bg-white p-6 rounded-xl shadow-lg border border-gray-100">
-            <h2 className="text-2xl font-bold text-pink-700 mb-4 border-b pb-2">Analizador de Rostro con IA</h2>
-            <p className="text-gray-600 mb-6">Sube una foto de tu rostro (con buena iluminación) y describe tu rutina actual o preocupaciones para recibir un análisis de piel personalizado y sugerencias de rutina.</p>
-
-            <form onSubmit={handleSubmit} className="space-y-6">
-                
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div>
-                        <label htmlFor="skinImage" className="block text-sm font-medium text-gray-700">
-                            Sube una foto de tu rostro:
-                        </label>
-                        <input
-                            type="file"
-                            id="skinImage"
-                            accept="image/png, image/jpeg"
-                            onChange={handleImageChange}
-                            className="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-pink-50 file:text-pink-700 hover:file:bg-pink-100"
-                        />
-                        <img 
-                            src={imagePreview} 
-                            alt="Previsualización del rostro" 
-                            className="w-full h-64 object-cover rounded-lg shadow-inner border border-gray-200 mt-4"
-                        />
-                    </div>
-                    <div>
-                        <label htmlFor="skinPrompt" className="block text-sm font-medium text-gray-700">
-                            Describe tu rutina o preocupaciones (opcional):
-                        </label>
-                        <textarea
-                            id="skinPrompt"
-                            rows="7"
-                            value={prompt}
-                            onChange={(e) => setPrompt(e.target.value)}
-                            className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-3 focus:ring-pink-500 focus:border-pink-500"
-                            placeholder="Ej: Tengo piel grasa y propensa al acné. Actualmente uso un limpiador y un hidratante simple."
-                        ></textarea>
-                    </div>
-                </div>
-
-                <button
-                    type="submit"
-                    disabled={isLoading || !base64Image}
-                    className="w-full px-6 py-3 bg-pink-600 text-white font-semibold rounded-lg shadow-md hover:bg-pink-700 transition duration-150 disabled:opacity-50"
-                >
-                    {isLoading ? (
-                        <span className="flex items-center justify-center">
-                            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                            </svg>
-                            Analizando Rostro...
-                        </span>
-                    ) : (
-                        'Obtener Análisis de Piel con IA'
-                    )}
-                </button>
-            </form>
-
-            {aiResponse && (
-                <div className="mt-8 p-4 bg-pink-50 rounded-lg border border-pink-200">
-                    <h3 className="text-xl font-semibold text-pink-800 mb-3">Diagnóstico y Rutina Sugerida</h3>
-                    <div className="prose max-w-none text-gray-700">
-                        <pre className="whitespace-pre-wrap font-sans text-sm">{aiResponse}</pre>
-                    </div>
-                </div>
-            )}
-        </div>
-    );
+    return { runGeneration, isLoading, aiResponse, setAiResponse, setIsLoading };
 };
 
 
-// --- COMPONENTE PRINCIPAL (APP) ---
-
-const App = () => {
-    const [dbInstance, setDbInstance] = useState(null);
-    const [authInstance, setAuthInstance] = useState(null);
+// Hook para la gestión de Firebase (Auth y Firestore)
+const useFirebase = () => {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
     const [userId, setUserId] = useState(null);
     const [isAuthReady, setIsAuthReady] = useState(false);
-    const [activeTab, setActiveTab] = useState('home');
-    const [weightData, setWeightData] = useState([]);
 
-    // 1. Inicialización de Firebase y Autenticación
     useEffect(() => {
-        if (!app || !auth || !db) return;
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
 
-        setDbInstance(db);
-        setAuthInstance(auth);
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
 
-        const unsubscribe = onAuthStateChanged(auth, async (user) => {
-            if (user) {
-                setUserId(user.uid);
-                setIsAuthReady(true);
-            } else if (initialAuthToken) {
-                try {
-                    // Intenta iniciar sesión con el token personalizado de Canvas
-                    const userCredential = await signInWithCustomToken(auth, initialAuthToken);
-                    setUserId(userCredential.user.uid);
-                } catch (error) {
-                    console.error("Error al iniciar sesión con token personalizado:", error);
-                    // Si falla, cae a anónimo
-                    await signInAnonymously(auth);
-                } finally {
+            // 1. Manejar autenticación
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
                     setIsAuthReady(true);
+                } else if (initialAuthToken) {
+                    try {
+                        await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                    } catch (error) {
+                        console.error("Error signing in with custom token:", error);
+                        await signInAnonymously(firebaseAuth);
+                        setUserId(firebaseAuth.currentUser?.uid || crypto.randomUUID());
+                        setIsAuthReady(true);
+                    }
+                } else {
+                    try {
+                        await signInAnonymously(firebaseAuth);
+                        setUserId(firebaseAuth.currentUser?.uid || crypto.randomUUID());
+                        setIsAuthReady(true);
+                    } catch (error) {
+                        console.error("Error signing in anonymously:", error);
+                        setUserId(crypto.randomUUID()); // Fallback if anonymous sign-in fails
+                        setIsAuthReady(true);
+                    }
                 }
-            } else {
-                // Si no hay token personalizado, usa anónimo
-                try {
-                    const userCredential = await signInAnonymously(auth);
-                    setUserId(userCredential.user.uid);
-                } catch (error) {
-                    console.error("Error al iniciar sesión anónimamente:", error);
-                    setUserId('anonymous-error');
-                } finally {
-                    setIsAuthReady(true);
-                }
-            }
-        });
+            });
 
-        return () => unsubscribe();
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Error initializing Firebase:", error);
+            setIsAuthReady(true); // Treat as ready even on failure
+        }
     }, []);
 
-    // 2. Escucha de Datos de Firestore (Peso)
-    useEffect(() => {
-        // Ejecutar solo si Firebase está listo, la autenticación ha finalizado y tenemos un userId
-        if (!dbInstance || !userId || !isAuthReady || !authInstance?.currentUser) {
+    return { db, auth, userId, isAuthReady };
+};
+
+
+// --- COMPONENTES DE VISTA ---
+
+// 1. Registro y Nutrición (Pestaña 'home')
+const HomeTracker = ({ db, userId, isAuthReady }) => {
+    const { runGeneration, isLoading, aiResponse, setAiResponse, setIsLoading } = useGeminiGenerator();
+    
+    const [record, setRecord] = useState({ 
+        mealDescription: '', 
+        image: null, 
+        base64Image: null 
+    });
+    const [history, setHistory] = useState([]);
+    const [isSaving, setIsSaving] = useState(false);
+    
+    const [message, setMessage] = useState('');
+    const [messageType, setMessageType] = useState(''); // success, error, info
+
+    // 2. Carga de la imagen
+    const handleImageChange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            setRecord(prev => ({ ...prev, image: file }));
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setRecord(prev => ({ ...prev, base64Image: reader.result }));
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+
+    // 3. Generar análisis de Nutrición
+    const analyzeMeal = useCallback(async () => {
+        if (!record.mealDescription && !record.base64Image) {
+            setMessageType('error');
+            setMessage('Por favor, describe tu comida o sube una imagen antes de analizar.');
             return;
         }
 
-        const q = query(
-            collection(dbInstance, `artifacts/${appId}/users/${userId}/weights`)
-        );
+        setMessageType('info');
+        setMessage('Generando análisis nutricional. Esto puede tardar unos segundos...');
+
+        const prompt = record.mealDescription || "Analiza los alimentos en esta imagen y proporciona un resumen nutricional, incluyendo macronutrientes, calorías estimadas y sugerencias de mejora dietética.";
+        const systemInstruction = "Eres un nutricionista IA experto. Tu tarea es analizar la descripción de la comida o la imagen provista por el usuario. Responde de forma amigable y concisa, utilizando viñetas (formato Markdown) para el desglose de nutrientes y calorías. Proporciona siempre sugerencias de mejora o un comentario positivo.";
+
+        await runGeneration({ 
+            prompt, 
+            base64Image: record.base64Image, 
+            systemInstruction 
+        });
+
+        setMessage(''); // Clear info message after generation starts or finishes
+    }, [record.mealDescription, record.base64Image, runGeneration]);
+
+    // 4. Guardar registro
+    const saveRecord = async () => {
+        if (!db || !userId) return;
+
+        if (!record.mealDescription && !record.base64Image) {
+            setMessageType('error');
+            setMessage('Necesitas una descripción o una imagen para guardar el registro.');
+            return;
+        }
+
+        setIsSaving(true);
+        setMessageType('info');
+        setMessage('Guardando registro...');
+
+        // Prepara los datos a guardar (solo guardamos la base64 si existe, o un enlace si fuera una app real)
+        const dataToSave = {
+            description: record.mealDescription,
+            analysis: aiResponse || "Análisis pendiente",
+            timestamp: new Date().toISOString(),
+            hasImage: !!record.base64Image
+            // En una app real NO se guarda la base64, solo el link de Storage
+            // Aquí lo simplificamos para la demo
+        };
+
+        try {
+            const historyCollection = collection(db, `artifacts/${appId}/users/${userId}/nutrition_history`);
+            await setDoc(doc(historyCollection), dataToSave); 
+            
+            // Limpiar formulario y respuesta AI después de guardar
+            setRecord({ mealDescription: '', image: null, base64Image: null });
+            setAiResponse(null);
+            
+            setMessageType('success');
+            setMessage('¡Registro guardado exitosamente!');
+        } catch (error) {
+            console.error("Error saving record:", error);
+            setMessageType('error');
+            setMessage(`Error al guardar: ${error.message}`);
+        } finally {
+            setIsSaving(false);
+            setTimeout(() => setMessage(''), 5000); // Clear message after 5 seconds
+        }
+    };
+
+    // 5. Escuchar el historial en tiempo real
+    useEffect(() => {
+        if (!db || !isAuthReady || !userId) return;
+
+        const historyCollection = collection(db, `artifacts/${appId}/users/${userId}/nutrition_history`);
+        
+        // Firestore query (sin orderBy para evitar errores de índice en Canvas)
+        const q = query(historyCollection); 
 
         const unsubscribe = onSnapshot(q, (snapshot) => {
-            const data = snapshot.docs.map(doc => ({
+            const records = snapshot.docs.map(doc => ({
                 id: doc.id,
-                ...doc.data()
+                ...doc.data(),
+                timestamp: doc.data().timestamp ? new Date(doc.data().timestamp) : new Date()
             }));
-            
-            // Ordenar los datos en el cliente por timestamp para que el progreso sea correcto
-            const sortedData = data.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-            
-            setWeightData(sortedData);
+
+            // Ordenar por timestamp localmente (descendente)
+            records.sort((a, b) => b.timestamp - a.timestamp);
+            setHistory(records);
         }, (error) => {
-            console.error("Error al escuchar los datos de peso:", error);
+            console.error("Error listening to history:", error);
+            setMessageType('error');
+            setMessage(`Error al cargar historial: ${error.message}`);
         });
 
         return () => unsubscribe();
-    }, [dbInstance, userId, isAuthReady, authInstance]);
+    }, [db, userId, isAuthReady]); // Dependencias para re-ejecutar el listener
 
+    // 6. Componente de Renderizado de Mensajes
+    const MessageDisplay = ({ msg, type }) => {
+        if (!msg) return null;
+        const colorClass = type === 'success' ? 'bg-green-100 text-green-700 border-green-400'
+                         : type === 'error' ? 'bg-red-100 text-red-700 border-red-400'
+                         : 'bg-blue-100 text-blue-700 border-blue-400';
+        return (
+            <div className={`p-3 rounded-lg border-l-4 font-medium mb-4 ${colorClass}`}>
+                {msg}
+            </div>
+        );
+    };
+
+    return (
+        <div className="space-y-8">
+            <MessageDisplay msg={message} type={messageType} />
+
+            {/* Formulario de Nuevo Registro */}
+            <div className="bg-white p-6 rounded-xl shadow-lg border border-indigo-100">
+                <h2 className="text-2xl font-bold text-indigo-800 mb-6 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    Nuevo Registro de Comida
+                </h2>
+                
+                <div className="grid md:grid-cols-2 gap-6">
+                    {/* Columna de Descripción */}
+                    <div>
+                        <label htmlFor="mealDescription" className="block text-sm font-medium text-gray-700 mb-2">
+                            Describe tu comida (o déjalo vacío si subes imagen)
+                        </label>
+                        <textarea
+                            id="mealDescription"
+                            rows="4"
+                            value={record.mealDescription}
+                            onChange={(e) => setRecord(prev => ({ ...prev, mealDescription: e.target.value }))}
+                            placeholder="Ej: Un tazón de avena con frutas, semillas de chía y un vaso de jugo de naranja."
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+                        />
+                    </div>
+                    
+                    {/* Columna de Imagen */}
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Sube una Imagen
+                        </label>
+                        <div className="flex items-center space-x-4">
+                            <input
+                                type="file"
+                                accept="image/*"
+                                onChange={handleImageChange}
+                                className="block w-full text-sm text-gray-500
+                                    file:mr-4 file:py-2 file:px-4
+                                    file:rounded-full file:border-0
+                                    file:text-sm file:font-semibold
+                                    file:bg-indigo-50 file:text-indigo-700
+                                    hover:file:bg-indigo-100
+                                "
+                            />
+                        </div>
+                        <div className="mt-4 border border-gray-200 rounded-lg overflow-hidden bg-gray-50">
+                            <img 
+                                src={record.base64Image || DEFAULT_IMAGE_URL} 
+                                alt="Vista previa de la comida" 
+                                className="w-full h-48 object-cover" 
+                            />
+                        </div>
+                    </div>
+                </div>
+
+                <div className="mt-6 flex justify-end space-x-4">
+                    <button
+                        onClick={analyzeMeal}
+                        disabled={isLoading || isSaving}
+                        className="flex items-center justify-center px-6 py-3 border border-transparent text-base font-medium rounded-full shadow-md text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 transition duration-150 transform hover:scale-[1.02]"
+                    >
+                        {isLoading ? (
+                            <svg className="animate-spin h-5 w-5 mr-3 text-white" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        ) : (
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L12 20.25l2.25-3.25m-4.5 0H16.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                        )}
+                        {isLoading ? 'Analizando...' : 'Analizar Comida con IA'}
+                    </button>
+                    <button
+                        onClick={saveRecord}
+                        disabled={!aiResponse || isSaving || isLoading}
+                        className="flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-full shadow-md text-white bg-green-500 hover:bg-green-600 disabled:opacity-50 transition duration-150 transform hover:scale-[1.02]"
+                    >
+                         {isSaving ? 'Guardando...' : 'Guardar Registro'}
+                    </button>
+                </div>
+            </div>
+
+            {/* Respuesta de la IA */}
+            {aiResponse && (
+                <div className="bg-indigo-50 p-6 rounded-xl shadow-inner border border-indigo-200">
+                    <h3 className="text-xl font-bold text-indigo-700 mb-4 flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor"><path d="M5 4a1 1 0 011-1h8a1 1 0 011 1v12a1 1 0 01-1 1H6a1 1 0 01-1-1V4zm4 11a1 1 0 102 0 1 1 0 00-2 0z" /></svg>
+                        Análisis Nutricional de Gemini
+                    </h3>
+                    <div className="prose max-w-none text-gray-700 leading-relaxed" dangerouslySetInnerHTML={{ __html: aiResponse.replace(/\n/g, '<br />') }} />
+                </div>
+            )}
+
+            {/* Historial */}
+            <div className="bg-gray-50 p-6 rounded-xl shadow-lg border border-gray-200">
+                <h2 className="text-2xl font-bold text-gray-800 mb-6 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    Historial de Comidas ({history.length})
+                </h2>
+                {history.length === 0 ? (
+                    <p className="text-gray-500 italic">Aún no tienes registros guardados.</p>
+                ) : (
+                    <div className="space-y-4">
+                        {history.map((item) => (
+                            <div key={item.id} className="p-4 bg-white border border-gray-100 rounded-lg shadow-sm hover:shadow-md transition duration-150">
+                                <p className="text-sm text-gray-500 mb-1">
+                                    {item.timestamp.toLocaleString('es-ES', { dateStyle: 'medium', timeStyle: 'short' })} 
+                                    {item.hasImage && <span className="ml-2 px-2 py-0.5 text-xs font-semibold rounded-full bg-indigo-100 text-indigo-800">Con Imagen</span>}
+                                </p>
+                                <p className="text-gray-900 font-semibold">{item.description || 'Comida sin descripción'}</p>
+                                <div className="mt-2 text-sm text-gray-700 border-t pt-2 max-h-24 overflow-y-auto">
+                                    <h4 className="font-medium text-indigo-600">Análisis:</h4>
+                                    <div className="prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: item.analysis.replace(/\n/g, '<br />') }} />
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+// 2. Diario de Piel (Pestaña 'skin')
+const SkinJournal = ({ db, userId, isAuthReady }) => {
+    const { runGeneration, isLoading, aiResponse, setAiResponse, setIsLoading } = useGeminiGenerator();
+    
+    const [skinRecord, setSkinRecord] = useState({ 
+        notes: '', 
+        base64Image: null,
+        image: null
+    });
+    const [history, setHistory] = useState([]);
+    const [isSaving, setIsSaving] = useState(false);
+    
+    const [message, setMessage] = useState('');
+    const [messageType, setMessageType] = useState('');
+
+    // 2. Carga de la imagen
+    const handleImageChange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            setSkinRecord(prev => ({ ...prev, image: file }));
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setSkinRecord(prev => ({ ...prev, base64Image: reader.result }));
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+
+    // 3. Generar análisis de Piel
+    const analyzeSkin = useCallback(async () => {
+        if (!skinRecord.base64Image) {
+            setMessageType('error');
+            setMessage('Por favor, sube una imagen de tu piel para analizar.');
+            return;
+        }
+
+        setMessageType('info');
+        setMessage('Analizando la condición de la piel. Esto puede tardar unos segundos...');
+        setAiResponse(null); // Clear previous analysis
+
+        const prompt = `Analiza la condición de la piel en esta imagen. Evalúa el nivel de hidratación, presencia de acné, enrojecimiento, o cualquier otra condición notable. ${skinRecord.notes ? `Nota adicional del usuario: ${skinRecord.notes}` : ''}. Proporciona un breve resumen de la condición actual y una sugerencia de rutina de cuidado o ingrediente clave a considerar.`;
+        const systemInstruction = "Eres un dermatólogo IA experto. Tu tarea es analizar la imagen de la piel provista por el usuario. Responde de forma profesional, concisa y utiliza viñetas (formato Markdown) para el desglose de hallazgos. Nunca diagnostiques o reemplaces a un médico; siempre incluye una advertencia al final de que solo son sugerencias cosméticas/rutinas.";
+
+        await runGeneration({ 
+            prompt, 
+            base64Image: skinRecord.base64Image, 
+            systemInstruction 
+        });
+
+        setMessage(''); // Clear info message
+    }, [skinRecord.base64Image, skinRecord.notes, runGeneration]);
+
+    // 4. Guardar registro
+    const saveSkinRecord = async () => {
+        if (!db || !userId) return;
+
+        if (!skinRecord.base64Image) {
+            setMessageType('error');
+            setMessage('Necesitas una imagen para guardar el registro de la piel.');
+            return;
+        }
+
+        setIsSaving(true);
+        setMessageType('info');
+        setMessage('Guardando diario...');
+
+        const dataToSave = {
+            notes: skinRecord.notes,
+            analysis: aiResponse || "Análisis pendiente",
+            timestamp: new Date().toISOString(),
+            hasImage: true
+        };
+
+        try {
+            const journalCollection = collection(db, `artifacts/${appId}/users/${userId}/skin_journal`);
+            await setDoc(doc(journalCollection), dataToSave); 
+            
+            // Limpiar formulario y respuesta AI después de guardar
+            setSkinRecord({ notes: '', image: null, base64Image: null });
+            setAiResponse(null);
+            
+            setMessageType('success');
+            setMessage('¡Registro de piel guardado exitosamente!');
+        } catch (error) {
+            console.error("Error saving skin record:", error);
+            setMessageType('error');
+            setMessage(`Error al guardar: ${error.message}`);
+        } finally {
+            setIsSaving(false);
+            setTimeout(() => setMessage(''), 5000);
+        }
+    };
+
+    // 5. Escuchar el historial en tiempo real
+    useEffect(() => {
+        if (!db || !isAuthReady || !userId) return;
+
+        const journalCollection = collection(db, `artifacts/${appId}/users/${userId}/skin_journal`);
+        
+        const q = query(journalCollection); 
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const records = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                timestamp: doc.data().timestamp ? new Date(doc.data().timestamp) : new Date()
+            }));
+
+            records.sort((a, b) => b.timestamp - a.timestamp);
+            setHistory(records);
+        }, (error) => {
+            console.error("Error listening to skin journal:", error);
+            setMessageType('error');
+            setMessage(`Error al cargar historial: ${error.message}`);
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, isAuthReady]);
+
+    const MessageDisplay = ({ msg, type }) => {
+        if (!msg) return null;
+        const colorClass = type === 'success' ? 'bg-green-100 text-green-700 border-green-400'
+                         : type === 'error' ? 'bg-red-100 text-red-700 border-red-400'
+                         : 'bg-pink-100 text-pink-700 border-pink-400';
+        return (
+            <div className={`p-3 rounded-lg border-l-4 font-medium mb-4 ${colorClass}`}>
+                {msg}
+            </div>
+        );
+    };
+
+    return (
+        <div className="space-y-8">
+            <MessageDisplay msg={message} type={messageType} />
+
+            {/* Formulario de Nuevo Registro de Piel */}
+            <div className="bg-white p-6 rounded-xl shadow-lg border border-pink-100">
+                <h2 className="text-2xl font-bold text-pink-800 mb-6 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
+                    </svg>
+                    Nuevo Registro del Diario de Piel
+                </h2>
+                
+                <div className="grid md:grid-cols-2 gap-6">
+                    {/* Columna de Imagen */}
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Sube una Imagen de tu Piel
+                        </label>
+                        <div className="flex items-center space-x-4">
+                            <input
+                                type="file"
+                                accept="image/*"
+                                onChange={handleImageChange}
+                                className="block w-full text-sm text-gray-500
+                                    file:mr-4 file:py-2 file:px-4
+                                    file:rounded-full file:border-0
+                                    file:text-sm file:font-semibold
+                                    file:bg-pink-50 file:text-pink-700
+                                    hover:file:bg-pink-100
+                                "
+                            />
+                        </div>
+                        <div className="mt-4 border border-gray-200 rounded-lg overflow-hidden bg-gray-50">
+                            <img 
+                                src={skinRecord.base64Image || DEFAULT_IMAGE_URL} 
+                                alt="Vista previa de la piel" 
+                                className="w-full h-48 object-cover" 
+                            />
+                        </div>
+                    </div>
+
+                     {/* Columna de Notas */}
+                    <div>
+                        <label htmlFor="skinNotes" className="block text-sm font-medium text-gray-700 mb-2">
+                            Notas (¿Qué has notado hoy? ¿Nuevos productos?)
+                        </label>
+                        <textarea
+                            id="skinNotes"
+                            rows="4"
+                            value={skinRecord.notes}
+                            onChange={(e) => setSkinRecord(prev => ({ ...prev, notes: e.target.value }))}
+                            placeholder="Ej: La piel se siente un poco más tirante después de la limpieza. Probé un nuevo sérum de vitamina C."
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-pink-500 focus:border-pink-500 transition duration-150"
+                        />
+                    </div>
+                </div>
+
+                <div className="mt-6 flex justify-end space-x-4">
+                    <button
+                        onClick={analyzeSkin}
+                        disabled={isLoading || isSaving || !skinRecord.base64Image}
+                        className="flex items-center justify-center px-6 py-3 border border-transparent text-base font-medium rounded-full shadow-md text-white bg-pink-600 hover:bg-pink-700 disabled:opacity-50 transition duration-150 transform hover:scale-[1.02]"
+                    >
+                        {isLoading ? (
+                            <svg className="animate-spin h-5 w-5 mr-3 text-white" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        ) : (
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                        )}
+                        {isLoading ? 'Analizando...' : 'Analizar Piel con IA'}
+                    </button>
+                    <button
+                        onClick={saveSkinRecord}
+                        disabled={!aiResponse || isSaving || isLoading || !skinRecord.base64Image}
+                        className="flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-full shadow-md text-white bg-purple-500 hover:bg-purple-600 disabled:opacity-50 transition duration-150 transform hover:scale-[1.02]"
+                    >
+                         {isSaving ? 'Guardando...' : 'Guardar Diario'}
+                    </button>
+                </div>
+            </div>
+
+            {/* Respuesta de la IA */}
+            {aiResponse && (
+                <div className="bg-pink-50 p-6 rounded-xl shadow-inner border border-pink-200">
+                    <h3 className="text-xl font-bold text-pink-700 mb-4 flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h.01a1 1 0 100-2H10V9a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
+                        Diagnóstico IA (Sugerencias Cosméticas)
+                    </h3>
+                    <div className="prose max-w-none text-gray-700 leading-relaxed" dangerouslySetInnerHTML={{ __html: aiResponse.replace(/\n/g, '<br />') }} />
+                    <p className="mt-4 text-xs text-red-500 italic">
+                        **Advertencia:** Este análisis es solo para fines informativos y cosméticos, y no reemplaza el consejo de un dermatólogo o profesional médico.
+                    </p>
+                </div>
+            )}
+
+            {/* Historial */}
+            <div className="bg-gray-50 p-6 rounded-xl shadow-lg border border-gray-200">
+                <h2 className="text-2xl font-bold text-gray-800 mb-6 flex items-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7.712 7.712A2.5 2.5 0 0121 15.284V17a2 2 0 01-2 2H5a2 2 0 01-2-2V9.284a2.5 2.5 0 01.586-1.414L7 3z" /></svg>
+                    Historial del Diario de Piel ({history.length})
+                </h2>
+                {history.length === 0 ? (
+                    <p className="text-gray-500 italic">Aún no tienes entradas en tu diario de piel.</p>
+                ) : (
+                    <div className="space-y-4">
+                        {history.map((item) => (
+                            <div key={item.id} className="p-4 bg-white border border-gray-100 rounded-lg shadow-sm hover:shadow-md transition duration-150">
+                                <p className="text-sm text-gray-500 mb-1 flex justify-between">
+                                    <span>{item.timestamp.toLocaleString('es-ES', { dateStyle: 'medium', timeStyle: 'short' })}</span>
+                                    <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-pink-100 text-pink-800">Con Imagen</span>
+                                </p>
+                                <p className="text-gray-900 font-semibold mb-2">{item.notes || 'Sin notas adicionales'}</p>
+                                <div className="mt-2 text-sm text-gray-700 border-t pt-2 max-h-24 overflow-y-auto">
+                                    <h4 className="font-medium text-pink-600">Análisis:</h4>
+                                    <div className="prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: item.analysis.replace(/\n/g, '<br />') }} />
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+
+// --- COMPONENTE PRINCIPAL (App) ---
+
+const App = () => {
+    const [activeTab, setActiveTab] = useState('home');
+    const { db, userId, isAuthReady } = useFirebase();
+
+    // Mensaje de carga inicial mientras se autentica Firebase
+    if (!isAuthReady) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-50">
+                <div className="flex flex-col items-center p-6 bg-white rounded-xl shadow-lg">
+                    <svg className="animate-spin h-8 w-8 text-indigo-600 mb-3" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                    <p className="text-gray-700">Conectando con la base de datos...</p>
+                </div>
+            </div>
+        );
+    }
 
     const renderContent = () => {
-        const commonProps = { userId, db: dbInstance, isAuthReady };
-
-        if (activeTab === 'home') {
-            return (
-                <div className="space-y-8">
-                    <WeightTracker {...commonProps} weightData={weightData} />
-                    <AITools {...commonProps} weightData={weightData} />
-                </div>
-            );
-        } else if (activeTab === 'skin') {
-            return <SkinJournal {...commonProps} />;
+        if (!db) {
+             return <div className="p-4 text-red-600 bg-red-100 rounded-lg">Error: Base de datos no inicializada. Revisa la configuración de Firebase.</div>;
         }
-        return null;
+
+        switch (activeTab) {
+            case 'home':
+                return <HomeTracker db={db} userId={userId} isAuthReady={isAuthReady} />;
+            case 'skin':
+                return <SkinJournal db={db} userId={userId} isAuthReady={isAuthReady} />;
+            default:
+                return <HomeTracker db={db} userId={userId} isAuthReady={isAuthReady} />;
+        }
     };
 
     return (
         <div className="min-h-screen bg-gray-50 font-sans">
-            <header className="bg-white shadow-md p-4 sticky top-0 z-10">
-                <div className="max-w-4xl mx-auto flex flex-col sm:flex-row justify-between items-center space-y-4 sm:space-y-0">
-                    <h1 className="text-2xl font-extrabold text-gray-800">
-                        Health IA Tracker
+            <header className="bg-white shadow-md p-4 sticky top-0 z-10 border-b">
+                <div className="max-w-4xl mx-auto flex justify-between items-center">
+                    <h1 className="text-3xl font-extrabold text-gray-900 tracking-tight">
+                        Health IA <span className="text-indigo-600">Tracker</span>
                     </h1>
-                    
                     <div className="flex space-x-4">
                         <button
                             onClick={() => setActiveTab('home')}
@@ -630,7 +742,7 @@ const App = () => {
                 </div>
             </header>
 
-            <main className="max-w-4xl mx-auto py-8 px-4 sm:px-0">
+            <main className="max-w-4xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
                 {renderContent()}
             </main>
 
@@ -641,6 +753,4 @@ const App = () => {
     );
 };
 
-// --- LÓGICA DE MONTAJE PARA EL ENTORNO CANVAS/React ---
-// Exportamos el componente principal por defecto. El entorno se encarga de montarlo.
 export default App;
