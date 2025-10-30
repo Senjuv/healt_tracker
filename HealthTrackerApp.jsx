@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+// import { createRoot } from 'react-dom/client'; // ELIMINADA: Causaba conflicto de montaje
 import { initializeApp } from 'firebase/app';
 import { 
     getAuth, signInAnonymously, signInWithCustomToken, 
@@ -707,7 +708,7 @@ const App = () => {
     // 2. Suscripción a datos de peso (Firestore Listener)
     useEffect(() => {
         // CORRECCIÓN DE ERRORES DE PERMISOS: Añadimos una comprobación estricta para asegurar
-        // que la autenticación ha finalizado y el usuario (auth.currentUser) existe antes 
+        // que la autenticación ha finalizado y el usuario (auth.currentUser) exista antes 
         // de intentar configurar el listener de Firestore.
 
         if (!db || !userId || !isAuthReady || !auth || !auth.currentUser) {
@@ -818,3 +819,11 @@ const App = () => {
                 ID de Usuario: <span className="font-mono text-xs break-all">{userId || 'Cargando...'}</span> | App ID: {appId}
             </footer>
         </div>
+    );
+};
+
+// --- LÓGICA DE MONTAJE (Ajuste para entorno Canvas) ---
+// Se elimina la lógica de montaje explícita que causaba el conflicto.
+// El componente principal debe ser el export por defecto para que el entorno lo monte.
+
+export default App;
