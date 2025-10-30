@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { createRoot } from 'react-dom/client'; // RE-AÑADIDA: Necesaria para el montaje en entornos de build (Vercel)
 import { initializeApp } from 'firebase/app';
 import { 
     getAuth, signInAnonymously, signInWithCustomToken, 
@@ -8,8 +7,6 @@ import {
 import { 
     getFirestore, doc, setDoc, 
     onSnapshot, collection, query, 
-    // Se elimina 'orderBy' para evitar errores de índice y permisos
-    // en entornos de desarrollo o Canvas.
 } from 'firebase/firestore';
 
 // --- CONFIGURACIÓN DE FIREBASE Y VARIABLES GLOBALES ---
@@ -17,14 +14,9 @@ const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__f
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-health-app';
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-// Habilitar logging para debug (útil para ver si la consulta se dispara)
-// import { setLogLevel } from 'firebase/firestore';
-// setLogLevel('debug'); 
-
 const API_MODEL_TEXT = "gemini-2.5-flash-preview-09-2025";
 const API_URL_TEXT = `https://generativelanguage.googleapis.com/v1beta/models/${API_MODEL_TEXT}:generateContent?key=`;
 
-// URL para el placeholder de carga de imagen/documento (si el usuario no sube una)
 const DEFAULT_IMAGE_URL = "https://placehold.co/300x200/222/fff?text=Carga+tu+Imagen";
 
 // --- INICIALIZACIÓN DE FIREBASE ---
@@ -84,6 +76,7 @@ const WeightTracker = ({ userId, db, isAuthReady, weightData }) => {
 
         try {
             const timestamp = new Date().toISOString();
+            // Usamos el timestamp como ID de documento para asegurar un orden único y natural
             const docRef = doc(db, `artifacts/${appId}/users/${userId}/weights`, timestamp);
             
             await setDoc(docRef, {
@@ -101,7 +94,8 @@ const WeightTracker = ({ userId, db, isAuthReady, weightData }) => {
         }
     };
 
-    const sortedData = [...weightData].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    // La data ya viene ordenada del useEffect principal
+    const sortedData = weightData; 
 
     const totalEntries = sortedData.length;
     const initialWeight = totalEntries > 0 ? sortedData[0].weight : 0;
@@ -167,6 +161,50 @@ const WeightTracker = ({ userId, db, isAuthReady, weightData }) => {
     );
 };
 
+// Función de generación de IA
+const generateAIResponse = async (currentPrompt, imageBase64, systemInstruction, enableSearch, setAiResponse, setIsLoading) => {
+    setIsLoading(true);
+    setAiResponse(null);
+
+    try {
+        const apiKey = ""; 
+        const apiUrl = `${API_URL_TEXT}${apiKey}`;
+
+        const parts = [{ text: currentPrompt }];
+        if (imageBase64) {
+            parts.push({
+                inlineData: {
+                    mimeType: "image/png", // Asumiendo que vamos a manejar PNG para consistencia
+                    data: imageBase64
+                }
+            });
+        }
+
+        const payload = {
+            contents: [{ parts }],
+            systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
+            tools: enableSearch ? [{ "google_search": {} }] : undefined,
+        };
+
+        const response = await fetchWithBackoff(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+        const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No se pudo obtener respuesta de la IA.";
+        setAiResponse(text);
+
+    } catch (error) {
+        console.error("Error en la llamada a la API de Gemini:", error);
+        setAiResponse(`Error al procesar la solicitud: ${error.message}`);
+    } finally {
+        setIsLoading(false);
+    }
+};
+
+
 // Componente para las herramientas de IA
 const AITools = ({ userId, weightData, db }) => {
     const [aiResponse, setAiResponse] = useState(null);
@@ -193,48 +231,6 @@ const AITools = ({ userId, weightData, db }) => {
         }
     };
 
-    const generateAIResponse = useCallback(async (currentPrompt, imageBase64, systemInstruction, enableSearch = false) => {
-        setIsLoading(true);
-        setAiResponse(null);
-
-        try {
-            const apiKey = ""; 
-            const apiUrl = `${API_URL_TEXT}${apiKey}`;
-
-            const parts = [{ text: currentPrompt }];
-            if (imageBase64) {
-                parts.push({
-                    inlineData: {
-                        mimeType: "image/png", // Asumiendo que vamos a manejar PNG para consistencia
-                        data: imageBase64
-                    }
-                });
-            }
-
-            const payload = {
-                contents: [{ parts }],
-                systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
-                tools: enableSearch ? [{ "google_search": {} }] : undefined,
-            };
-
-            const response = await fetchWithBackoff(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-
-            const result = await response.json();
-            const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No se pudo obtener respuesta de la IA.";
-            setAiResponse(text);
-
-        } catch (error) {
-            console.error("Error en la llamada a la API de Gemini:", error);
-            setAiResponse(`Error al procesar la solicitud: ${error.message}`);
-        } finally {
-            setIsLoading(false);
-        }
-    }, []);
-
     // Función principal para manejar el envío de la herramienta
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -242,6 +238,7 @@ const AITools = ({ userId, weightData, db }) => {
         let systemInstruction = "";
         let finalPrompt = "";
         let enableSearch = false;
+        let imageToSend = null;
 
         switch (currentTool) {
             case 'mealPlan':
@@ -255,6 +252,7 @@ const AITools = ({ userId, weightData, db }) => {
                 }
                 systemInstruction = "Actúa como un analista nutricional. Basándote en la imagen de la comida, haz una estimación de los ingredientes principales, calorías aproximadas y una breve nota sobre su balance nutricional. Responde con un formato de lista en Markdown.";
                 finalPrompt = "Analiza esta comida y proporciona una estimación nutricional.";
+                imageToSend = base64Image;
                 break;
             case 'symptomCheck':
                 systemInstruction = "Actúa como un asistente de salud informativa. Analiza los síntomas proporcionados y ofrece información general sobre posibles causas comunes y recomendaciones de estilo de vida. ADVERTENCIA: Nunca proporciones diagnósticos médicos. La respuesta debe ser cautelosa y en formato de lista en Markdown.";
@@ -274,7 +272,7 @@ const AITools = ({ userId, weightData, db }) => {
                 return;
         }
 
-        await generateAIResponse(finalPrompt, currentTool === 'photoAnalysis' ? base64Image : null, systemInstruction, enableSearch);
+        await generateAIResponse(finalPrompt, imageToSend, systemInstruction, enableSearch, setAiResponse, setIsLoading);
     };
 
     // Renderizado del formulario de la herramienta activa
@@ -346,11 +344,12 @@ const AITools = ({ userId, weightData, db }) => {
                             setBase64Image(null);
                             setImagePreview(DEFAULT_IMAGE_URL);
                         }}
-                        className={`px-4 py-2 text-sm font-semibold rounded-full transition duration-150 ${
-                            currentTool === tool 
+                        className={`px-4 py-2 text-sm font-semibold rounded-full transition duration-150 
+                            ${currentTool === tool 
                                 ? 'bg-indigo-500 text-white shadow-md' 
                                 : 'bg-gray-100 text-gray-700 hover:bg-indigo-50'
-                        }`}
+                            }`
+                        }
                     >
                         {tool === 'mealPlan' && 'Planificador de Comidas'}
                         {tool === 'photoAnalysis' && 'Análisis de Foto'}
@@ -385,7 +384,7 @@ const AITools = ({ userId, weightData, db }) => {
                 <div className="mt-8 p-4 bg-gray-50 rounded-lg border border-gray-200">
                     <h3 className="text-xl font-semibold text-gray-800 mb-3">Respuesta de la IA</h3>
                     <div className="prose max-w-none text-gray-700">
-                        {/* Renderizar respuesta de la IA (puedes usar una librería de Markdown si la tuvieras) */}
+                        {/* El uso de <pre> es simple pero efectivo para mostrar la respuesta en Markdown */}
                         <pre className="whitespace-pre-wrap font-sans text-sm">{aiResponse}</pre>
                     </div>
                 </div>
@@ -395,7 +394,7 @@ const AITools = ({ userId, weightData, db }) => {
 };
 
 // Componente de Diario de Piel (Skin)
-const SkinJournal = ({ generateAIResponse }) => {
+const SkinJournal = () => {
     const [aiResponse, setAiResponse] = useState(null);
     const [isLoading, setIsLoading] = useState(false);
     const [base64Image, setBase64Image] = useState(null);
@@ -425,16 +424,10 @@ const SkinJournal = ({ generateAIResponse }) => {
             return;
         }
         
-        setIsLoading(true);
-        setAiResponse(null);
-
         const systemInstruction = "Actúa como un experto en cuidado de la piel (skincare). Analiza la imagen del rostro proporcionada, identifica problemas comunes (como acné, enrojecimiento, sequedad o brillo) y ofrece una rutina básica de cuidado con sugerencias de ingredientes clave. La respuesta debe ser estructurada en Markdown (Análisis, Rutina Sugerida, Ingredientes Clave).";
         const finalPrompt = `Analiza la imagen del rostro. El usuario proporciona la siguiente información adicional: ${prompt || 'Ninguna'}. Genera el análisis de la piel.`;
         
-        // Uso de la función pasada por prop, asumiendo que es una función que retorna otra función
-        // para manejar el estado de este componente.
-        const runGeneration = generateAIResponse(finalPrompt, base64Image, systemInstruction);
-        await runGeneration(setAiResponse, setIsLoading);
+        await generateAIResponse(finalPrompt, base64Image, systemInstruction, false, setAiResponse, setIsLoading);
     };
 
     return (
@@ -576,12 +569,11 @@ const App = () => {
                 ...doc.data()
             }));
             
-            // Ordenar los datos en el cliente por timestamp (descendente)
+            // Ordenar los datos en el cliente por timestamp para que el progreso sea correcto
             const sortedData = data.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
             
             setWeightData(sortedData);
         }, (error) => {
-            // Este es el error que típicamente ocurre si el índice o los permisos son incorrectos.
             console.error("Error al escuchar los datos de peso:", error);
         });
 
@@ -590,13 +582,7 @@ const App = () => {
 
 
     const renderContent = () => {
-        // La función de IA ahora se pasa como un wrapper para manejar el estado local del SkinJournal
-        const generateSkinAIWrapper = (prompt, base64Image, systemInstruction, enableSearch) => (setAiResponse, setIsLoading) => {
-            const runGeneration = AITools.generateAIResponse; // Obtener la función estática
-            return runGeneration(prompt, base64Image, systemInstruction, enableSearch)(setAiResponse, setIsLoading);
-        };
-
-        const commonProps = { userId, db: dbInstance, isAuthReady, generateAIResponse: generateSkinAIWrapper };
+        const commonProps = { userId, db: dbInstance, isAuthReady };
 
         if (activeTab === 'home') {
             return (
@@ -655,63 +641,6 @@ const App = () => {
     );
 };
 
-// Se asegura que la función de generación de IA esté disponible para el SkinJournal
-// Esta función ahora retorna una función que, al ser llamada, ejecuta la lógica de fetch.
-AITools.generateAIResponse = (prompt, base64Image, systemInstruction, enableSearch) => (setAiResponse, setIsLoading) => {
-    // La función interna es la que se ejecuta cuando el componente SkinJournal llama a handleSubmit
-    const runGeneration = async () => {
-        setIsLoading(true);
-        setAiResponse(null);
-
-        try {
-            const apiKey = ""; 
-            const apiUrl = `${API_URL_TEXT}${apiKey}`;
-
-            const parts = [{ text: prompt }];
-            if (base64Image) {
-                parts.push({
-                    inlineData: {
-                        mimeType: "image/png", 
-                        data: base64Image
-                    }
-                });
-            }
-
-            const payload = {
-                contents: [{ parts }],
-                systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
-                tools: enableSearch ? [{ "google_search": {} }] : undefined,
-            };
-
-            const response = await fetchWithBackoff(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-
-            const result = await response.json();
-            const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No se pudo obtener respuesta de la IA.";
-            setAiResponse(text);
-
-        } catch (error) {
-            console.error("Error en la llamada a la API de Gemini (Passthrough):", error);
-            setAiResponse(`Error al procesar la solicitud: ${error.message}`);
-        } finally {
-            setIsLoading(false);
-        }
-    };
-    return runGeneration(); // Retorna la Promesa de ejecución
-};
-
+// --- LÓGICA DE MONTAJE PARA EL ENTORNO CANVAS/React ---
+// Exportamos el componente principal por defecto. El entorno se encarga de montarlo.
 export default App;
-
-// --- LÓGICA DE MONTAJE PARA ENTORNOS DE PRODUCCIÓN (Vercel) ---
-// **Si estás desplegando en Vercel**, y este es el archivo de entrada (entry point)
-// de tu aplicación, DESCOMENTA el siguiente bloque.
-/*
-const container = document.getElementById('root');
-if (container) {
-    const root = createRoot(container);
-    root.render(<App />);
-}
-*/
